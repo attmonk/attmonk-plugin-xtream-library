@@ -92,7 +92,7 @@ jobs:
         uses: actions/create-github-app-token@v2
         with:
           app-id: 5324952
-          private-key: ${{ secrets.ATTMONK_CI_APP_KEY }}
+          private-key: ${{ secrets.ATTMONK_CI_APPKEY || secrets.ATTMONK_CI_APP_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 

@@ -4,6 +4,8 @@ github.com/attmonk/silo-plugins v0.1.16 h1:FRUWgibyiuuX5rxC0/ZtS5PJY1S3rgasn0vCv
 github.com/attmonk/silo-plugins v0.1.16/go.mod h1:4kC/IAc9AwyozAC88e2sg3zmMyLLCRRvjgh9VQaI24I=
 github.com/attmonk/silo-plugins v0.1.17 h1:kvAlqcsK9JtZlc7z8BJu+gpgdasrBL+XzwocAd75sQQ=
 github.com/attmonk/silo-plugins v0.1.17/go.mod h1:4kC/IAc9AwyozAC88e2sg3zmMyLLCRRvjgh9VQaI24I=
+github.com/attmonk/silo-plugins v0.1.18 h1:u8kZsyuMYuk04KJKZOGQrYOX0bzSjRfO881UJTihwys=
+github.com/attmonk/silo-plugins v0.1.18/go.mod h1:4kC/IAc9AwyozAC88e2sg3zmMyLLCRRvjgh9VQaI24I=
 github.com/bufbuild/protocompile v0.14.1 h1:iA73zAf/fyljNjQKwYzUHD6AD4R8KMasmwa/FBatYVw=
 github.com/bufbuild/protocompile v0.14.1/go.mod h1:ppVdAIhbr2H8asPk6k4pY7t9zB1OU5DoEw9xY/FUi1c=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
