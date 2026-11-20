@@ -1,0 +1,63 @@
+[2026-07-11 00:00] Feature: Verify and codify the Silo SDK capability contract
+Status: Complete
+Notes: Route requests have no typed trusted viewer identity and responses have finite byte bodies; do not build a server proxy or per-user stream enforcement into v1.
+
+[2026-07-11 00:00] Feature: Verify Xtream and M3U/XMLTV source contracts
+Status: Complete
+Notes: Series info is normalized into ordered episodes; provider Catch-up requires archive metadata and M3U/XMLTV remains a reduced source.
+
+[2026-07-12 02:10] Feature: Deliver standalone Xtreme app shell and public routes
+Status: Complete
+Notes: The manifest and browser app use `/xtream`; keep the internal path adapter only until the remaining Dispatcharr handlers are removed.
+
+[2026-07-12 02:15] Feature: Deliver Xtream Live TV guide and playback gateway
+Status: Complete
+Notes: Live TV, guide, redacted Catalog payloads, and the provider-bound `/xtream/stream` gateway are verified at the route boundary.
+
+[2026-07-12 02:25] Feature: Deliver Xtream VOD, series, and episode playback
+Status: Complete
+Notes: Series details are fetched server-side; VOD and episodes enter the existing Browser Player through authenticated Xtreme gateways.
+
+[2026-07-12 02:35] Feature: Add Xtream provider catch-up replay
+Status: Complete
+Notes: Archive eligibility reaches the guide UI; replay resolves through the provider gateway and never creates a local buffer or DVR asset.
+
+[2026-07-12 03:00] Feature: Reject retired Dispatcharr public feature routes
+Status: Complete
+Notes: The Xtreme namespace returns 404 for recordings, sports, events, and local-timeshift routes even when a caller bypasses manifest discovery.
+
+[2026-07-12 03:10] Feature: Establish Xtreme module identity
+Status: Complete
+Notes: The Go module and all in-repository imports now resolve through the standalone Xtreme repository path.
+
+[2026-07-12 03:20] Feature: Restrict runtime configuration to Xtreme sources
+Status: Complete
+Notes: Runtime configuration ignores inherited Dispatcharr and category entries; only the documented standalone connection object is applied.
+
+[2026-07-12 03:30] Feature: Remove inherited local-timeshift implementation
+Status: Complete
+Notes: The local buffer manager and all timeshift routes were deleted; provider Catch-up remains the supported replay feature.
+
+[2026-07-12 03:40] Feature: Remove Dispatcharr sports and event discovery
+Status: Complete
+Notes: Sports/event providers, matching logic, route handlers, and tests are removed; the public Xtreme namespace remains limited to supported media features.
+
+[2026-07-12 03:50] Feature: Remove runtime catalog persistence
+Status: Complete
+Notes: Startup no longer loads or passes an on-disk catalog snapshot, so the running plugin uses a disposable in-memory catalog only.
+
+[2026-07-12 04:00] Feature: Align scheduled Xtreme refresh tasks
+Status: Complete
+Notes: Scheduled task execution now accepts the same xtream-prefixed catalog, channel, and guide task identifiers advertised by the manifest.
+
+[2026-07-12 04:10] Feature: Validate standalone connection on configure
+Status: Complete
+Notes: Invalid Xtream or M3U settings are rejected by runtime configuration before they can reach a refresh task.
+
+[2026-07-12 04:20] Feature: Remove inherited admin route surface
+Status: Complete
+Notes: The packaged manifest and Xtreme router omit/reject legacy admin and category-settings endpoints.
+
+[2026-07-13 17:30] Feature: Add alternate XMLTV EPG sources (#9)
+Status: Complete
+Notes: XC Admin now stores per-source alternate XMLTV settings, tests match coverage, supports XML and XML.GZ feeds, and merges guide programs with fill-missing or prefer-alternate behavior without changing channel/playback identity.

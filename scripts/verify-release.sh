@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
+
+expected_version="${1:-}"
+mode="${2:-}"
+manifest_version="$(node -p "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')).version")"
+
+if [[ -n "${expected_version}" && "${manifest_version}" != "${expected_version}" ]]; then
+  printf 'manifest version %s does not match release version %s\n' "${manifest_version}" "${expected_version}" >&2
+  exit 1
+fi
+
+if [[ "${mode}" == "--version-only" ]]; then
+  exit 0
+fi
+
+node --test scripts/sports-moments.test.mjs scripts/sports-following.test.mjs scripts/sports-multiview.test.mjs
+node --check internal/plugin/ui/sports_assist.js
+node --test scripts/sports-assist.test.mjs
+node --check internal/plugin/ui/sports_companion.js
+node --test scripts/sports-companion.test.mjs
+go vet ./...
+go test ./...
+go test -race ./...
+for script in internal/plugin/ui/*.js; do
+  node --check "${script}"
+done
+node --test scripts/review-fixes.test.mjs
+node --test scripts/watch-session.test.mjs
+node scripts/test-features.cjs
+node --test scripts/prefs-sync.test.mjs
+node --test scripts/prefs-profile.test.mjs
+go run . manifest >/dev/null
+
+node --check internal/plugin/ui/admin.js
+node --test scripts/sports-guide-admin.test.mjs

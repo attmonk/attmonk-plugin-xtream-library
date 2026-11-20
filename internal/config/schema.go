@@ -1,0 +1,197 @@
+package config
+
+import (
+	"strings"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+)
+
+type ConfigSchema = pluginv1.ConfigSchema
+
+const categorySettingsJSONSchema = `{
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["normal", "delimiter"],
+      "default": "normal"
+    },
+    "delimiter": {
+      "type": "string",
+      "enum": ["pipe", "dash"],
+      "default": "pipe"
+    },
+    "virtualGroupLabel": {
+      "type": "string",
+      "default": "Virtual Groups"
+    },
+    "ecmEnabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "ecmURL": {
+      "type": "string",
+      "default": ""
+    },
+    "allowRecordingsByDefault": {
+      "type": "boolean",
+      "default": true
+    },
+    "allowDirectProviderURLs": {
+      "type": "boolean",
+      "default": true,
+      "description": "TS live, VOD, series and catch-up can't be relayed through Silo, so playback sends the provider URL, including your account credentials, to the viewer's browser. Turn off to block those streams unless the provider serves HLS."
+    },
+    "sportsFirstPlayerEnabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "liveRewindEnabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "liveRewindCacheGB": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 500,
+      "default": 5
+    },
+    "liveRewindWindowMinutes": {
+      "type": "integer",
+      "enum": [15, 30, 60, 90, 120],
+      "default": 30
+    },
+    "liveRewindMinFreeGB": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 2
+    },
+    "liveRewindMaxChannels": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 20
+    },
+    "virtualGroupSource": {
+      "type": "string",
+      "enum": ["group", "group_channel", "profile_group", "channel"],
+      "default": "group"
+    },
+    "collapseDuplicateVirtualGroups": {
+      "type": "boolean",
+      "default": true
+    },
+    "inferChannelNameGroups": {
+      "type": "boolean",
+      "default": false
+    },
+    "categoryRenames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sourcePath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["sourcePath", "displayName"],
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "categoryAliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sourcePath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "aliasPath": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["sourcePath", "aliasPath"],
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "eventKeywords": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "categoryId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "categoryName": {
+            "type": "string",
+            "minLength": 1
+          },
+          "keywords": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "excludeKeywords": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "default": []
+          },
+          "eventSeries": {
+            "type": "boolean",
+            "default": false
+          },
+          "groupWindowMinutes": {
+            "type": "integer",
+            "minimum": 15,
+            "maximum": 360,
+            "default": 60
+          }
+        },
+        "required": ["categoryId", "categoryName", "keywords"],
+        "additionalProperties": false
+      },
+      "default": []
+    }
+  },
+  "additionalProperties": false
+}`
+
+func GlobalConfigSchema() []*ConfigSchema {
+	return nil
+}
+
+func UserConfigSchema() []*ConfigSchema {
+	return []*ConfigSchema{
+		objectSchema("preferences", "Preferences", "Per-user Xtream browsing preferences stored by Silo.", `{"type":"object","properties":{"sportsStatsDelaySeconds":{"type":"integer","minimum":0,"maximum":300},"favorites":{"type":"object","additionalProperties":{"type":"boolean"}},"favoriteOrder":{"type":"array","items":{"type":"string"}},"hiddenCategories":{"type":"object","additionalProperties":{"type":"boolean"}},"groupCategoriesByPipe":{"type":"boolean"},"recentSearches":{"type":"array","items":{"type":"string"}},"recentChannels":{"type":"array","items":{"type":"string"}},"continueWatching":{"type":"object","additionalProperties":true},"playback":{"type":"object","additionalProperties":true},"profiles":{"type":"object","additionalProperties":{"type":"object"}},"customGroups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"order":{"type":"integer"}},"required":["id","name"],"additionalProperties":false}},"customGroupMemberships":{"type":"object","additionalProperties":{"type":"array","items":{"type":"string"}}}},"additionalProperties":false}`, false, []*pluginv1.AdminFormField{}, "Save preferences"),
+	}
+}
+
+func objectSchema(key, title, description, jsonSchema string, required bool, fields []*pluginv1.AdminFormField, submitLabel string) *ConfigSchema {
+	if key == "preferences" {
+		jsonSchema = strings.Replace(jsonSchema, `"sportsStatsDelaySeconds":`, `"sportsMomentsEnabled":{"type":"boolean"},"sportsChannelDelays":{"type":"object","maxProperties":256,"additionalProperties":{"type":"integer","minimum":0,"maximum":300}},"sportsSwitchMode":{"type":"string","enum":["off","suggest","auto"]},"sportsFavoritePlayers":{"type":"object","maxProperties":200,"additionalProperties":{"type":"object","properties":{"name":{"type":"string","maxLength":120},"leagueId":{"type":"string","maxLength":80},"teamSlug":{"type":"string","maxLength":120},"teamName":{"type":"string","maxLength":120},"observedAtUnix":{"type":"number"}},"required":["name","leagueId"],"additionalProperties":false}},"sportsMultiviewLayout":{"type":"integer","enum":[2,4]},"sportsMultiviewPresets":{"type":"object","maxProperties":8,"additionalProperties":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":40},"layout":{"type":"integer","enum":[2,4]},"channelIds":{"type":"array","maxItems":4,"items":{"type":"string"}}},"required":["name","layout","channelIds"],"additionalProperties":false}},"sportsStatsDelaySeconds":`, 1)
+	}
+	return &pluginv1.ConfigSchema{
+		Key:         key,
+		Title:       title,
+		Description: description,
+		JsonSchema:  jsonSchema,
+		Required:    required,
+		AdminForm:   &pluginv1.AdminFormDescriptor{Fields: fields, SubmitLabel: submitLabel},
+	}
+}

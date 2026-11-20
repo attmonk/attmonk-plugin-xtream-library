@@ -1,0 +1,2199 @@
+package plugin
+
+import (
+	"context"
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"html"
+	"log"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/cache"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/config"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/matching"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/model"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/dispatcharr"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/xmltv"
+	"github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/xtream"
+	sharedhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
+	mediaweb "github.com/attmonk/silo-plugins/pkg/livemedia/web"
+)
+
+//go:embed assets/hls.min.js assets/mpegts.min.js
+var playerAssets embed.FS
+
+var (
+	assetVersionOnce  sync.Once
+	assetVersionValue string
+)
+
+const adminSourceConnectionTestTimeout = 8 * time.Second
+
+type HTTPRoutesServer struct {
+	mediaBackoff  mediaweb.SourceBackoff
+	watchOwnerMu  sync.Mutex
+	watchOwners   map[string]string
+	watchSeen     map[string]time.Time
+	watchBindings map[string]string
+	mediaOnce     sync.Once
+	media         *mediaweb.Controller
+	pluginv1.UnimplementedHttpRoutesServer
+	store               *cache.Store
+	settingsProvider    func() config.Settings
+	adminPersister      func(context.Context, map[string]any) error
+	adminStorage        adminSettingsStorage
+	sourceMutationMu    sync.Mutex
+	sourceRegistry      *config.SourceRegistry
+	sourceEPGTester     func(context.Context, config.XtreamSource, []model.Channel) (alternateEPGTestPayload, error)
+	coordinator         *RefreshCoordinator
+	hydrateMu           sync.Mutex
+	refreshMu           sync.Mutex
+	guideWarmLastUnix   int64
+	profileWarmLastUnix int64
+	relay               *hlsRelay
+	accountPool         *accountPool
+	sportsProvider      sportsProvider
+	sportsCache         sportsEventCache
+	sportsMu            sync.Mutex
+	sportsStats         footballStatsCache
+	sportsGuide         sportsGuideCache
+	sportsPrepared      sportsPreparedCache
+	sportsPreparedMu    sync.Mutex
+	sportsImages        *sportsImageCache
+	guideIndex          guideIndexCache
+	livetvGuideFill     livetvGuideFill
+	// tenantUserID is set on a per-user tenant server (see TenantRouter); it
+	// is the only Silo user whose requests ever reach that server.
+	tenantUserID string
+	// upstreamClient, when set, is used for every request to a provider or
+	// XMLTV URL. Tenants set a restricted client: their URLs come from users.
+	upstreamClient *http.Client
+	// adminSettingsFrom, on a tenant, is the shared server that owns the
+	// admin's settings.
+	adminSettingsFrom *HTTPRoutesServer
+}
+
+type catalogSyncer interface {
+	SyncNow(ctx context.Context, settings config.Settings, nowUnix int64) error
+}
+
+type forceCatalogSyncer interface {
+	ForceSyncNow(ctx context.Context, settings config.Settings, nowUnix int64) error
+}
+
+type guideOnlySyncer interface {
+	RefreshGuideOnlyNow(ctx context.Context, settings config.Settings, nowUnix int64) error
+}
+
+func NewHTTPRoutesServer(store *cache.Store) *HTTPRoutesServer {
+	return newHTTPRoutesServer(store, nil, nil)
+}
+
+func NewHTTPRoutesServerWithSettings(store *cache.Store, settingsProvider func() config.Settings) *HTTPRoutesServer {
+	return newHTTPRoutesServer(store, settingsProvider, nil)
+}
+
+func NewHTTPRoutesServerWithSyncer(store *cache.Store, settingsProvider func() config.Settings, syncer catalogSyncer) *HTTPRoutesServer {
+	return newHTTPRoutesServer(store, settingsProvider, syncer)
+}
+
+func NewHTTPRoutesServerWithSyncerAndAdminSettingsFile(store *cache.Store, settingsProvider func() config.Settings, syncer catalogSyncer, path string) *HTTPRoutesServer {
+	server := newHTTPRoutesServer(store, settingsProvider, syncer)
+	server.adminStorage = NewFileAdminSettingsStorage(path)
+	return server
+}
+
+func NewHTTPRoutesServerWithCoordinatorAndAdminSettingsFile(store *cache.Store, settingsProvider func() config.Settings, coordinator *RefreshCoordinator, path string) *HTTPRoutesServer {
+	server := newHTTPRoutesServer(store, settingsProvider, nil)
+	server.coordinator = coordinator
+	server.adminStorage = NewFileAdminSettingsStorage(path)
+	return server
+}
+
+func newHTTPRoutesServer(store *cache.Store, settingsProvider func() config.Settings, syncer catalogSyncer) *HTTPRoutesServer {
+	server := &HTTPRoutesServer{store: store, settingsProvider: settingsProvider, sourceRegistry: config.NewSourceRegistry(""), relay: newHLSRelay(), accountPool: newAccountPool(nil)}
+	server.sourceEPGTester = testAlternateEPGSource
+	server.sportsProvider = newSportarrSportsProvider(&http.Client{Timeout: 8 * time.Second})
+	server.sportsImages = newSportsImageCache(defaultSportsImageCacheDir, secureSportsImageHTTPClient())
+	if syncer != nil {
+		server.coordinator = NewRefreshCoordinator(syncer)
+	}
+	return server
+}
+
+type ChannelsPayload struct {
+	SourceName string           `json:"sourceName"`
+	Channels   []PublicChannel  `json:"channels"`
+	Categories []model.Category `json:"categories"`
+}
+
+type PublicChannel struct {
+	ID               string   `json:"id"`
+	SourceID         string   `json:"sourceId"`
+	Name             string   `json:"name"`
+	Number           string   `json:"number,omitempty"`
+	GuideID          string   `json:"guideId,omitempty"`
+	LogoURL          string   `json:"logoUrl,omitempty"`
+	CategoryID       string   `json:"categoryId,omitempty"`
+	CategoryName     string   `json:"categoryName,omitempty"`
+	ProfileIDs       []string `json:"profileIds,omitempty"`
+	StreamFormat     string   `json:"streamFormat,omitempty"`
+	HLSBufferSeconds int      `json:"hlsBufferSeconds,omitempty"`
+	Catchup          bool     `json:"catchup,omitempty"`
+	CatchupMins      int      `json:"catchupMinutes,omitempty"`
+}
+
+type PublicVODItem struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	CategoryID  string `json:"categoryId,omitempty"`
+	PosterURL   string `json:"posterUrl,omitempty"`
+	Rating      string `json:"rating,omitempty"`
+	Added       string `json:"added,omitempty"`
+	Container   string `json:"container,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type GuidePayload struct {
+	Programs []model.Program `json:"programs"`
+}
+
+type guidePingRequest struct {
+	ChannelIDs []string `json:"channelIds"`
+}
+
+type GuidePingPayload struct {
+	Status          string `json:"status"`
+	CheckedChannels int    `json:"checkedChannels"`
+	CurrentPrograms int    `json:"currentPrograms"`
+	Refreshing      bool   `json:"refreshing"`
+}
+
+// Keep visible-guide warmups comfortably inside Silo's 10-second plugin HTTP
+// deadline. Xtream providers often serialize or throttle short-EPG calls, so a
+// larger batch can time out even when the provider is healthy.
+const guidePingChannelLimit = 8
+
+type ContentPayload struct {
+	Available  bool             `json:"available"`
+	Reason     string           `json:"reason,omitempty"`
+	Categories []model.Category `json:"categories"`
+	Items      any              `json:"items"`
+}
+
+type EpisodePayload struct {
+	ID        string `json:"id"`
+	Season    int    `json:"season"`
+	Number    int    `json:"number"`
+	Title     string `json:"title"`
+	Container string `json:"container,omitempty"`
+}
+
+type SeriesInfoPayload struct {
+	Available bool             `json:"available"`
+	Name      string           `json:"name,omitempty"`
+	Episodes  []EpisodePayload `json:"episodes"`
+	Reason    string           `json:"reason,omitempty"`
+}
+
+type RecordingsPayload struct {
+	Available bool              `json:"available"`
+	Reason    string            `json:"reason,omitempty"`
+	Items     []json.RawMessage `json:"items"`
+}
+
+type RecordingCapabilityPayload struct {
+	Available   bool   `json:"available"`
+	CanSchedule bool   `json:"canSchedule"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+type scheduleRecordingRequest struct {
+	ChannelID   string `json:"channelId"`
+	ProgramID   string `json:"programId"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	StartUnix   int64  `json:"startUnix"`
+	EndUnix     int64  `json:"endUnix"`
+}
+
+type AppCapabilities struct {
+	LiveTV                bool   `json:"liveTv"`
+	Guide                 bool   `json:"guide"`
+	VOD                   bool   `json:"vod"`
+	Series                bool   `json:"series"`
+	Recordings            bool   `json:"recordings"`
+	Favorites             bool   `json:"favorites"`
+	HiddenCategories      bool   `json:"hiddenCategories"`
+	BackendProxySupported bool   `json:"backendProxySupported"`
+	StreamMode            string `json:"streamMode"`
+	NativeLiveTVExport    bool   `json:"nativeLiveTvExport"`
+}
+
+type AppPayload struct {
+	SourceMultiviewLimits map[string]int   `json:"sourceMultiviewLimits,omitempty"`
+	Status                HealthPayload    `json:"status"`
+	Source                model.Source     `json:"source"`
+	Channels              []PublicChannel  `json:"channels"`
+	Categories            []model.Category `json:"categories"`
+	Capabilities          AppCapabilities  `json:"capabilities"`
+	// IsAdmin mirrors the host-stamped X-Silo-User-Role header so the UI can
+	// hide admin-only controls (force refresh). The server enforces those
+	// routes independently.
+	IsAdmin bool `json:"isAdmin"`
+	// UserSources is true when each user brings their own providers;
+	// SourcesConfigured then says whether this user has added any.
+	UserSources       bool `json:"userSources"`
+	SourcesConfigured bool `json:"sourcesConfigured"`
+}
+
+type watchRequest struct {
+	SessionID string `json:"sessionId"`
+	ItemKind  string `json:"itemKind"`
+	ItemID    string `json:"itemId"`
+	ItemName  string `json:"itemName"`
+	Reason    string `json:"reason"`
+}
+
+func (s *HTTPRoutesServer) Handle(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if mediaweb.Handles("/xtream", request.GetPath()) {
+		return s.mediaController().Handle(ctx, request), nil
+	}
+	if isRetiredXtreamPublicRoute(request.GetPath()) {
+		return textResponse(http.StatusNotFound, "route not found"), nil
+	}
+	path := normalizePublicPath(request.GetPath())
+	if imagePath, _, _ := strings.Cut(path, "?"); strings.HasPrefix(imagePath, "/dispatcharr/api/sports/image/") || imagePath == "/dispatcharr/api/sports/image" {
+		if !s.sportsFeatureEnabled() {
+			return textResponse(http.StatusNotFound, "Sports is disabled"), nil
+		}
+		return s.handleSportsImage(ctx, request), nil
+	}
+	if strings.HasPrefix(path, "/dispatcharr/api/sports") {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 7*time.Second)
+		defer cancel()
+	}
+	switch path {
+	case "/dispatcharr/api/sports":
+		return s.handleSports(ctx, request)
+	case "/dispatcharr/api/sports/league-teams":
+		return s.handleSportsLeagueTeams(ctx, request)
+	case "/dispatcharr/api/sports/favorites":
+		return s.handleSportsFavorite(request)
+	case "/dispatcharr", "/dispatcharr/player", "/dispatcharr/admin":
+		return htmlResponse(http.StatusOK, s.playerPageHTML(request)), nil
+	case "/dispatcharr/assets/xc-runtime-a.js", "/assets/xc-runtime-a.js",
+		"/dispatcharr/assets/hls.min.js", "/assets/hls.min.js":
+		return playerLibraryAssetResponse("assets/hls.min.js")
+	case "/dispatcharr/assets/xc-runtime-b.js", "/assets/xc-runtime-b.js",
+		"/dispatcharr/assets/mpegts.min.js", "/assets/mpegts.min.js":
+		return playerLibraryAssetResponse("assets/mpegts.min.js")
+	case "/dispatcharr/assets/app.js", "/assets/app.js":
+		return playerUIAssetResponse("ui/app.js", "application/javascript; charset=utf-8")
+	case "/dispatcharr/assets/lineup.js", "/assets/lineup.js":
+		return playerUIAssetResponse("ui/lineup.js", "application/javascript; charset=utf-8")
+	case "/dispatcharr/assets/app.css", "/assets/app.css":
+		return textAssetResponse([]byte(playerStylesCSS()), "text/css; charset=utf-8")
+	case "/dispatcharr/status", "/dispatcharr/api/status":
+		return s.respondJSON(http.StatusOK, s.healthPayload(request))
+	case "/dispatcharr/api/refresh":
+		return s.handleRefresh(ctx, request)
+	case "/dispatcharr/api/refresh-channels":
+		return s.handleChannelRefresh(ctx, request)
+	case "/dispatcharr/api/app":
+		s.ensureCatalogHydrated(ctx)
+		return s.respondJSON(http.StatusOK, s.buildAppPayload(request))
+	case "/dispatcharr/channels", "/dispatcharr/api/channels":
+		s.ensureCatalogHydrated(ctx)
+		return s.respondJSON(http.StatusOK, s.channelsPayload())
+	case "/dispatcharr/guide", "/dispatcharr/api/guide":
+		s.ensureCatalogHydrated(ctx)
+		query, err := parseGuideQuery(request)
+		if err != nil {
+			return textResponse(http.StatusBadRequest, err.Error()), nil
+		}
+		index, err := s.windowGuideIndex(ctx, query.ChannelIDs, query.Window)
+		if err != nil {
+			return textResponse(http.StatusServiceUnavailable, "guide cache is temporarily unavailable"), nil
+		}
+		return s.respondJSON(http.StatusOK, GuidePayload{Programs: index.query(query.ChannelIDs, query.Window)})
+	case "/dispatcharr/api/guide/ping":
+		return s.handleGuidePing(ctx, request)
+	case "/dispatcharr/image":
+		return s.relay.resume(ctx, queryValue(request, "relay_token"), s.relayConfiguredHosts(), request)
+	case "/dispatcharr/api/categories":
+		s.ensureCatalogHydrated(ctx)
+		return s.respondJSON(http.StatusOK, s.categoriesPayload())
+	case "/dispatcharr/api/vod":
+		s.ensureCatalogHydrated(ctx)
+		return s.respondJSON(http.StatusOK, s.vodPayload())
+	case "/dispatcharr/api/series":
+		s.ensureCatalogHydrated(ctx)
+		return s.respondJSON(http.StatusOK, s.seriesPayload())
+	case "/dispatcharr/api/series/info":
+		return s.handleSeriesInfo(ctx, request)
+	case "/silo-compat/livetv/v1/info":
+		return s.handleLiveTVInfo(ctx), nil
+	case "/silo-compat/livetv/v1/channels":
+		return s.handleLiveTVChannels(ctx), nil
+	case "/silo-compat/livetv/v1/stream":
+		return s.handleLiveTVStream(ctx, request), nil
+	case "/silo-compat/livetv/v1/session/heartbeat":
+		return s.handleLiveTVSession(request, false), nil
+	case "/silo-compat/livetv/v1/session/stop":
+		return s.handleLiveTVSession(request, true), nil
+	case "/silo-compat/livetv/v1/programs":
+		return s.handleLiveTVPrograms(ctx, request), nil
+	case "/dispatcharr/api/recordings/capability":
+		return s.handleRecordingCapability(ctx)
+	case "/dispatcharr/api/recordings":
+		s.ensureCatalogHydrated(ctx)
+		if request.GetMethod() == http.MethodPost {
+			return s.handleScheduleRecording(ctx, request)
+		}
+		return s.handleRecordings(ctx)
+	case "/dispatcharr/api/preferences":
+		return s.handlePreferences(request)
+	case "/dispatcharr/api/admin-settings":
+		return s.handleAdminSettings(ctx, request)
+	case "/dispatcharr/api/my-sources":
+		if s.tenantUserID == "" {
+			return textResponse(http.StatusNotFound, "per-user providers are turned off"), nil
+		}
+		return s.handleAdminSources(ctx, request)
+	case "/dispatcharr/api/my-refresh":
+		if s.tenantUserID == "" {
+			return textResponse(http.StatusNotFound, "per-user providers are turned off"), nil
+		}
+		return s.handleRefresh(ctx, request)
+	case "/dispatcharr/api/admin-sources":
+		return s.handleAdminSources(ctx, request)
+	case "/dispatcharr/api/favorites":
+		return s.handleFavorite(request)
+	case "/dispatcharr/api/hidden-categories":
+		return s.handleHiddenCategory(request)
+	case "/dispatcharr/api/playback":
+		return s.handlePlaybackSettings(request)
+	case "/dispatcharr/api/watch/start":
+		return s.handleWatchStart(request)
+	case "/dispatcharr/api/watch/heartbeat":
+		return s.handleWatchHeartbeat(request)
+	case "/dispatcharr/api/watch/stop":
+		return s.handleWatchStop(request)
+	case "/dispatcharr/stream":
+		if relayToken := queryValue(request, "relay_token"); relayToken != "" {
+			return s.relay.resume(ctx, relayToken, s.relayConfiguredHosts(), request)
+		}
+		s.ensureCatalogHydrated(ctx)
+		channelID := queryValue(request, "channel_id")
+		if strings.TrimSpace(channelID) == "" {
+			return textResponse(http.StatusBadRequest, "missing channel_id query parameter"), nil
+		}
+		streamURL, err := s.resolveStreamURL(channelID, queryValue(request, "session_id"))
+		if err != nil {
+			return textResponse(http.StatusNotFound, err.Error()), nil
+		}
+		streamURL = appendPlaybackQuery(streamURL, request)
+		if strings.HasPrefix(channelID, "xtream:") && publicStreamFormat(streamURL) == "hls" {
+			return s.relay.start(ctx, streamURL, s.relayConfiguredHosts(), request)
+		}
+		return s.serveProviderStream(ctx, streamURL, request)
+	case "/dispatcharr/vod/stream":
+		s.ensureCatalogHydrated(ctx)
+		itemID := queryValue(request, "item_id")
+		if strings.TrimSpace(itemID) == "" {
+			return textResponse(http.StatusBadRequest, "missing item_id query parameter"), nil
+		}
+		streamURL, err := s.resolveVODStreamURL(ctx, itemID)
+		if err != nil {
+			return textResponse(http.StatusNotFound, err.Error()), nil
+		}
+		return s.serveProviderStream(ctx, streamURL, request)
+	case "/dispatcharr/episode/stream":
+		streamURL, err := s.resolveEpisodeStreamURL(ctx, queryValue(request, "series_id"), queryValue(request, "episode_id"))
+		if err != nil {
+			return textResponse(http.StatusNotFound, err.Error()), nil
+		}
+		return s.serveProviderStream(ctx, streamURL, request)
+	case "/dispatcharr/catchup/stream":
+		streamURL, err := s.resolveCatchupStreamURL(request)
+		if err != nil {
+			return textResponse(http.StatusNotFound, err.Error()), nil
+		}
+		return s.serveProviderStream(ctx, streamURL, request)
+	default:
+		return textResponse(http.StatusNotFound, "route not found"), nil
+	}
+}
+
+func isRetiredXtreamPublicRoute(path string) bool {
+	if !strings.HasPrefix(path, "/xtream/") {
+		return false
+	}
+	for _, segment := range []string{"/recordings", "/events", "/timeshift"} {
+		if strings.Contains(path, segment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *HTTPRoutesServer) resolveCatchupStreamURL(request *pluginv1.HandleHTTPRequest) (string, error) {
+	if s.settingsProvider == nil {
+		return "", fmt.Errorf("source settings are unavailable")
+	}
+	channelID := queryValue(request, "channel_id")
+	startUnix, err := strconv.ParseInt(queryValue(request, "start_unix"), 10, 64)
+	if err != nil || startUnix <= 0 {
+		return "", fmt.Errorf("invalid catchup start time")
+	}
+	endUnix, err := strconv.ParseInt(queryValue(request, "end_unix"), 10, 64)
+	if err != nil || endUnix <= startUnix {
+		return "", fmt.Errorf("invalid catchup end time")
+	}
+	var channel model.Channel
+	found := false
+	for _, candidate := range s.store.Current().Catalog.Channels {
+		if candidate.ID == channelID {
+			channel, found = candidate, true
+			break
+		}
+	}
+	if !found || !channel.Catchup || !strings.HasPrefix(channel.ID, "xtream:") {
+		return "", fmt.Errorf("catchup is unavailable for channel")
+	}
+	sourceID, streamID, err := parseScopedXtreamID(channel.ID, "xtream:")
+	if err != nil {
+		return "", fmt.Errorf("invalid xtream channel id")
+	}
+	duration := int((endUnix - startUnix + 59) / 60)
+	if duration <= 0 || duration > channel.CatchupMins {
+		return "", fmt.Errorf("catchup duration is unavailable")
+	}
+	settings := s.settingsProvider()
+	if settings.EffectiveSourceMode() != config.SourceModeXtream {
+		return "", fmt.Errorf("catchup is available only for Xtream Codes")
+	}
+	source, ok := settings.XtreamSourceByID(sourceID)
+	if !ok {
+		return "", fmt.Errorf("xtream source is unavailable")
+	}
+	target := s.xtreamClient(source.BaseURL, source.Username, source.Password).ResolveCatchupStreamURL(streamID, duration, time.Unix(startUnix, 0).UTC().Format("2006-01-02:15-04"))
+	if target == "" {
+		return "", fmt.Errorf("unable to resolve catchup stream")
+	}
+	return target, nil
+}
+
+func (s *HTTPRoutesServer) handleSeriesInfo(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if s.settingsProvider == nil {
+		return s.respondJSON(http.StatusServiceUnavailable, SeriesInfoPayload{Episodes: []EpisodePayload{}, Reason: "source settings are unavailable"})
+	}
+	sourceID, seriesID, err := parseScopedXtreamID(queryValue(request, "series_id"), "series:")
+	if err != nil || seriesID <= 0 {
+		return s.respondJSON(http.StatusBadRequest, SeriesInfoPayload{Episodes: []EpisodePayload{}, Reason: "invalid series_id"})
+	}
+	settings := s.settingsProvider()
+	if settings.EffectiveSourceMode() != config.SourceModeXtream {
+		return s.respondJSON(http.StatusOK, SeriesInfoPayload{Episodes: []EpisodePayload{}, Reason: "series are available only for Xtream Codes"})
+	}
+	source, ok := settings.XtreamSourceByID(sourceID)
+	if !ok {
+		return s.respondJSON(http.StatusNotFound, SeriesInfoPayload{Episodes: []EpisodePayload{}, Reason: "xtream source is unavailable"})
+	}
+	info, err := s.xtreamClient(source.BaseURL, source.Username, source.Password).SeriesInfo(ctx, seriesID)
+	if err != nil {
+		return s.respondJSON(http.StatusBadGateway, SeriesInfoPayload{Episodes: []EpisodePayload{}, Reason: "series information is unavailable"})
+	}
+	episodes := make([]EpisodePayload, 0, len(info.Episodes))
+	for _, episode := range info.Episodes {
+		episodes = append(episodes, EpisodePayload{ID: "episode:" + strconv.FormatInt(episode.ID, 10), Season: episode.SeasonNumber, Number: episode.EpisodeNumber, Title: episode.Title, Container: episode.ContainerExtension})
+	}
+	return s.respondJSON(http.StatusOK, SeriesInfoPayload{Available: true, Name: info.Info.Name, Episodes: episodes})
+}
+
+func normalizePublicPath(path string) string {
+	if path == "/xtream" {
+		return "/dispatcharr"
+	}
+	if strings.HasPrefix(path, "/xtream/") {
+		return "/dispatcharr/" + strings.TrimPrefix(path, "/xtream/")
+	}
+	return path
+}
+
+func (s *HTTPRoutesServer) ensureCatalogHydrated(ctx context.Context) {
+	if s.coordinator == nil || s.settingsProvider == nil {
+		return
+	}
+
+	settings := s.settingsProvider()
+	current := s.store.Current()
+	if len(current.Catalog.Channels) > 0 && catalogSnapshotMatchesSettings(current, settings) {
+		s.startBackgroundProfileWarm(current, settings)
+		return
+	}
+
+	s.hydrateMu.Lock()
+	defer s.hydrateMu.Unlock()
+
+	current = s.store.Current()
+	if len(current.Catalog.Channels) > 0 && catalogSnapshotMatchesSettings(current, settings) {
+		s.startBackgroundProfileWarm(current, settings)
+		return
+	}
+	if len(current.Catalog.Channels) > 0 && !catalogSnapshotMatchesSettings(current, settings) {
+		s.store.Replace(cache.Snapshot{
+			Catalog:   model.CatalogState{Source: model.LiveTVSource(modelSourceModeForSettings(settings))},
+			ConfigKey: config.CatalogCacheKey(settings),
+		})
+	}
+	if err := settings.Validate(); err != nil {
+		s.store.RecordFailure(time.Now().Unix(), err.Error())
+		return
+	}
+	if err := s.coordinator.Run(ctx, RefreshCatalog, settings, time.Now().Unix()); err != nil {
+		s.store.RecordFailure(time.Now().Unix(), err.Error())
+		return
+	}
+	if s.store.Current().ProgramCount() == 0 {
+		_, _ = s.startBackgroundGuideWarm(settings)
+	}
+}
+
+func catalogSnapshotMatchesSettings(snapshot cache.Snapshot, settings config.Settings) bool {
+	if len(snapshot.Catalog.Channels) == 0 {
+		return false
+	}
+	return snapshot.Catalog.Source.Mode == modelSourceModeForSettings(settings) && snapshot.ConfigKey == config.CatalogCacheKey(settings)
+}
+
+func profileCatalogNeedsRefresh(snapshot cache.Snapshot, settings config.Settings) bool {
+	if modelSourceModeForSettings(settings) != model.SourceModeDirectLogin {
+		return false
+	}
+	access := snapshot.Catalog.Source.ProfileAccess
+	return access == nil || access.Status == "unavailable"
+}
+
+func (s *HTTPRoutesServer) handleChannelRefresh(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() != http.MethodPost {
+		return textResponse(http.StatusMethodNotAllowed, "channel refresh requires POST"), nil
+	}
+	// The manifest already declares this route admin-only; enforce it here too.
+	if !s.canManageCatalog(request) {
+		return adminRequiredResponse("refreshing channels")
+	}
+	if s.coordinator == nil || s.settingsProvider == nil {
+		return textResponse(http.StatusServiceUnavailable, "catalog sync is not available"), nil
+	}
+
+	settings := s.settingsProvider()
+	if err := settings.Validate(); err != nil {
+		s.store.RecordFailure(time.Now().Unix(), err.Error())
+		return textResponse(http.StatusBadRequest, err.Error()), nil
+	}
+	_, started := s.coordinator.Start(RefreshChannels, settings)
+	status := http.StatusAccepted
+	if !started {
+		status = http.StatusOK
+	}
+	return s.respondJSON(status, s.buildAppPayload(request))
+}
+
+func (s *HTTPRoutesServer) startBackgroundProfileWarm(snapshot cache.Snapshot, settings config.Settings) bool {
+	if s.coordinator == nil || !profileCatalogNeedsRefresh(snapshot, settings) {
+		return false
+	}
+
+	now := time.Now().Unix()
+	s.refreshMu.Lock()
+	if s.profileWarmLastUnix > 0 && now-s.profileWarmLastUnix < 300 {
+		s.refreshMu.Unlock()
+		return false
+	}
+	s.profileWarmLastUnix = now
+	s.refreshMu.Unlock()
+
+	_, started := s.coordinator.Start(RefreshChannels, settings)
+	return started
+}
+
+func modelSourceModeForSettings(settings config.Settings) model.SourceMode {
+	switch settings.EffectiveSourceMode() {
+	case config.SourceModeAPIKey:
+		return model.SourceModeDirectLogin
+	case config.SourceModeXtream:
+		return model.SourceModeXtream
+	case config.SourceModeM3UXMLTV:
+		return model.SourceModeM3UXMLTV
+	default:
+		return model.SourceModeDirectLogin
+	}
+}
+
+func (s *HTTPRoutesServer) handleRefresh(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() != http.MethodPost {
+		return textResponse(http.StatusMethodNotAllowed, "refresh requires POST"), nil
+	}
+	if !s.canManageCatalog(request) {
+		return adminRequiredResponse("forcing a catalog refresh")
+	}
+	if s.coordinator == nil || s.settingsProvider == nil {
+		return textResponse(http.StatusServiceUnavailable, "catalog sync is not available"), nil
+	}
+
+	s.hydrateMu.Lock()
+	defer s.hydrateMu.Unlock()
+
+	settings := s.settingsProvider()
+	if err := settings.Validate(); err != nil {
+		s.store.RecordFailure(time.Now().Unix(), err.Error())
+		return textResponse(http.StatusBadRequest, err.Error()), nil
+	}
+	started := s.startBackgroundRefresh(settings)
+	status := http.StatusAccepted
+	if !started {
+		status = http.StatusOK
+	}
+	return s.respondJSON(status, s.buildAppPayload(request))
+}
+
+func (s *HTTPRoutesServer) handleGuidePing(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() != http.MethodPost {
+		return textResponse(http.StatusMethodNotAllowed, "guide ping requires POST"), nil
+	}
+	if s.coordinator == nil || s.settingsProvider == nil {
+		return textResponse(http.StatusServiceUnavailable, "catalog sync is not available"), nil
+	}
+
+	var payload guidePingRequest
+	if len(request.GetBody()) > 0 {
+		if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+			return textResponse(http.StatusBadRequest, "invalid guide ping payload"), nil
+		}
+	}
+
+	s.ensureCatalogHydrated(ctx)
+	channelIDs := normalizeChannelIDs(payload.ChannelIDs)
+	if len(channelIDs) > guidePingChannelLimit {
+		channelIDs = channelIDs[:guidePingChannelLimit]
+	}
+	nowUnix := time.Now().Unix()
+	currentGuide, err := s.store.Current().ProgramQuery(ctx, channelIDs, nowUnix, nowUnix+1)
+	if err != nil {
+		return textResponse(http.StatusServiceUnavailable, "guide cache is temporarily unavailable"), nil
+	}
+	currentPrograms := currentProgramCountForChannels(currentGuide, channelIDs, nowUnix)
+	if len(channelIDs) == 0 || currentPrograms >= len(channelIDs) {
+		return s.respondJSON(http.StatusOK, GuidePingPayload{Status: "fresh", CheckedChannels: len(channelIDs), CurrentPrograms: currentPrograms})
+	}
+
+	settings := s.settingsProvider()
+	if err := settings.Validate(); err != nil {
+		s.store.RecordFailure(time.Now().Unix(), err.Error())
+		return textResponse(http.StatusBadRequest, err.Error()), nil
+	}
+	s.store.MarkEPGLoading()
+	if err := s.coordinator.RunGuideChannels(ctx, settings, channelIDs, time.Now().Unix()); err != nil {
+		s.store.RecordEPGFailure(time.Now().Unix(), err.Error())
+		return textResponse(http.StatusBadGateway, "guide refresh failed"), nil
+	}
+	nowUnix = time.Now().Unix()
+	currentGuide, err = s.store.Current().ProgramQuery(ctx, channelIDs, nowUnix, nowUnix+1)
+	if err != nil {
+		return textResponse(http.StatusServiceUnavailable, "guide cache is temporarily unavailable"), nil
+	}
+	currentPrograms = currentProgramCountForChannels(currentGuide, channelIDs, nowUnix)
+	return s.respondJSON(http.StatusOK, GuidePingPayload{
+		Status:          "fresh",
+		CheckedChannels: len(channelIDs),
+		CurrentPrograms: currentPrograms,
+		Refreshing:      false,
+	})
+}
+
+func (s *HTTPRoutesServer) startBackgroundRefresh(settings config.Settings) bool {
+	if s.coordinator == nil {
+		return false
+	}
+	s.store.MarkEPGLoading()
+	_, started := s.coordinator.Start(RefreshForce, settings)
+	return started
+}
+
+func (s *HTTPRoutesServer) startBackgroundGuideWarm(settings config.Settings) (bool, string) {
+	if s.coordinator == nil {
+		return false, "unavailable"
+	}
+
+	now := time.Now().Unix()
+	s.refreshMu.Lock()
+	if s.guideWarmLastUnix > 0 && now-s.guideWarmLastUnix < 300 {
+		s.refreshMu.Unlock()
+		return false, "cooldown"
+	}
+	s.guideWarmLastUnix = now
+	s.refreshMu.Unlock()
+
+	s.store.MarkEPGLoading()
+	_, started := s.coordinator.Start(RefreshGuide, settings)
+	if !started {
+		return false, "refreshing"
+	}
+	return true, "refreshing"
+}
+
+func (s *HTTPRoutesServer) buildAppPayload(request *pluginv1.HandleHTTPRequest) AppPayload {
+	snapshot := s.store.Current()
+	streamFormat := s.xtreamLiveStreamFormat(snapshot.Catalog.Source.Mode)
+	source := snapshot.Catalog.Source
+	if !s.canViewDetailedDiagnostics(request) {
+		source = sourceWithoutDiagnosticMessage(source)
+	}
+	return AppPayload{
+		IsAdmin:               requestIsAdmin(request),
+		Status:                s.healthPayload(request),
+		Source:                source,
+		Channels:              s.publicChannels(snapshot.Catalog.Channels, streamFormat),
+		Categories:            s.publicCategories(liveCategories(snapshot)),
+		Capabilities:          appCapabilities(snapshot.Catalog.Source.Mode),
+		UserSources:           s.tenantUserID != "",
+		SourcesConfigured:     s.tenantUserID == "" || s.tenantHasSources(),
+		SourceMultiviewLimits: s.sourceMultiviewLimits(),
+	}
+}
+
+// Capacity hints contain no provider credentials or account identities. The pool
+// still reserves streams atomically; other viewers can consume capacity later.
+func (s *HTTPRoutesServer) sourceMultiviewLimits() map[string]int {
+	if s.sourceRegistry == nil || s.settingsProvider == nil {
+		return nil
+	}
+	sources, err := s.mutableSourceRegistry()
+	if err != nil {
+		return nil
+	}
+	limits := make(map[string]int, len(sources))
+	for _, source := range sources {
+		if !source.Enabled {
+			continue
+		}
+		capacity := 0
+		for _, account := range source.EffectivePlaybackAccounts() {
+			if account.ConnectionLimit <= 0 {
+				capacity = 4
+				break
+			}
+			capacity += min(account.ConnectionLimit, 4)
+			if capacity >= 4 {
+				capacity = 4
+				break
+			}
+		}
+		limits["xtream-source:"+source.ID] = capacity
+	}
+	return limits
+}
+
+func (s *HTTPRoutesServer) tenantHasSources() bool {
+	if s.sourceRegistry == nil {
+		return false
+	}
+	sources, err := s.sourceRegistry.Load()
+	return err == nil && len(sources) > 0
+}
+
+func (s *HTTPRoutesServer) healthPayload(request *pluginv1.HandleHTTPRequest) HealthPayload {
+	payload := BuildHealthPayload(s.store.Current())
+	if s.coordinator != nil {
+		payload.Refresh = s.coordinator.Status()
+	} else {
+		payload.Refresh = RefreshJob{State: RefreshIdle}
+	}
+	if !s.canViewDetailedDiagnostics(request) {
+		payload.LastError = ""
+		payload.EPGLastError = ""
+		payload.Refresh.Error = ""
+		if payload.ProfileAccess != nil {
+			access := *payload.ProfileAccess
+			access.Message = ""
+			payload.ProfileAccess = &access
+		}
+	}
+	return payload
+}
+
+func (s *HTTPRoutesServer) canViewDetailedDiagnostics(request *pluginv1.HandleHTTPRequest) bool {
+	return s.tenantUserID != "" || requestIsAdmin(request)
+}
+
+func sourceWithoutDiagnosticMessage(source model.Source) model.Source {
+	if source.ProfileAccess == nil {
+		return source
+	}
+	access := *source.ProfileAccess
+	access.Message = ""
+	source.ProfileAccess = &access
+	return source
+}
+
+func (s *HTTPRoutesServer) channelsPayload() ChannelsPayload {
+	snapshot := s.store.Current()
+	return ChannelsPayload{
+		SourceName: snapshot.Catalog.Source.Name,
+		Channels:   s.publicChannels(snapshot.Catalog.Channels, s.xtreamLiveStreamFormat(snapshot.Catalog.Source.Mode)),
+		Categories: s.publicCategories(liveCategories(snapshot)),
+	}
+}
+
+func (s *HTTPRoutesServer) categoriesPayload() map[string][]model.Category {
+	snapshot := s.store.Current()
+	return map[string][]model.Category{
+		"live":   s.publicCategories(liveCategories(snapshot)),
+		"vod":    s.publicCategories(snapshot.Catalog.Content.VODCategories),
+		"series": s.publicCategories(snapshot.Catalog.Content.SeriesCategories),
+	}
+}
+
+func (s *HTTPRoutesServer) vodPayload() ContentPayload {
+	snapshot := s.store.Current()
+	if snapshot.Catalog.Source.Mode == model.SourceModeM3UXMLTV {
+		return ContentPayload{Available: false, Reason: "M3U/XMLTV mode only exposes Live TV and guide data.", Items: []model.VODItem{}}
+	}
+	return ContentPayload{
+		Available:  len(snapshot.Catalog.Content.VODItems) > 0,
+		Categories: s.publicCategories(snapshot.Catalog.Content.VODCategories),
+		Items:      publicVODItems(snapshot.Catalog.Content.VODItems),
+	}
+}
+
+func (s *HTTPRoutesServer) xtreamLiveStreamFormat(sourceMode model.SourceMode) string {
+	if sourceMode != model.SourceModeXtream || s.settingsProvider == nil {
+		return ""
+	}
+	if s.settingsProvider().EffectiveXtreamLiveFormat() == "m3u8" {
+		return "hls"
+	}
+	return "mpegts"
+}
+
+func (s *HTTPRoutesServer) publicChannels(channels []model.Channel, xtreamFormat string) []PublicChannel {
+	result := make([]PublicChannel, 0, len(channels))
+	hlsBufferBySource, defaultHLSBuffer := s.hlsBufferSettings()
+	categoryPrefixes := s.sourceCategoryPrefixes()
+	for _, channel := range channels {
+		streamFormat := publicStreamFormat(channel.StreamURL)
+		if streamFormat == "" && strings.HasPrefix(channel.ID, "xtream:") {
+			streamFormat = xtreamFormat
+		}
+		hlsBufferSeconds := 0
+		if streamFormat == "hls" {
+			sourceID := strings.TrimPrefix(strings.TrimSpace(channel.SourceID), "xtream-source:")
+			hlsBufferSeconds = hlsBufferBySource[sourceID]
+			if hlsBufferSeconds == 0 {
+				hlsBufferSeconds = defaultHLSBuffer
+			}
+		}
+		result = append(result, PublicChannel{
+			ID:               channel.ID,
+			SourceID:         channel.SourceID,
+			Name:             channel.Name,
+			Number:           channel.Number,
+			GuideID:          channel.GuideID,
+			LogoURL:          s.relay.imageURL(channel.LogoURL),
+			CategoryID:       channel.CategoryID,
+			CategoryName:     categoryNameWithoutSource(channel.CategoryID, channel.CategoryName, categoryPrefixes),
+			ProfileIDs:       append([]string(nil), channel.ProfileIDs...),
+			StreamFormat:     streamFormat,
+			HLSBufferSeconds: hlsBufferSeconds,
+			Catchup:          channel.Catchup,
+			CatchupMins:      channel.CatchupMins,
+		})
+	}
+	return result
+}
+
+func (s *HTTPRoutesServer) hlsBufferSettings() (map[string]int, int) {
+	result := make(map[string]int)
+	defaultBuffer := config.DefaultHLSBufferSeconds
+	if s.settingsProvider == nil {
+		return result, defaultBuffer
+	}
+	sources := s.settingsProvider().EffectiveXtreamSources()
+	for _, source := range sources {
+		result[source.ID] = source.EffectiveHLSBufferSeconds()
+	}
+	if len(sources) == 1 {
+		defaultBuffer = sources[0].EffectiveHLSBufferSeconds()
+	}
+	return result, defaultBuffer
+}
+
+func publicStreamFormat(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	path := strings.ToLower(parsed.Path)
+	if strings.HasSuffix(path, ".m3u8") || strings.Contains(path, "/proxy/hls/") {
+		return "hls"
+	}
+	if strings.HasSuffix(path, ".ts") || strings.Contains(path, "/proxy/ts/") {
+		return "mpegts"
+	}
+	return ""
+}
+
+func publicVODItems(items []model.VODItem) []PublicVODItem {
+	result := make([]PublicVODItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, PublicVODItem{
+			ID:          item.ID,
+			Name:        item.Name,
+			CategoryID:  item.CategoryID,
+			PosterURL:   item.PosterURL,
+			Rating:      item.Rating,
+			Added:       item.Added,
+			Container:   item.Container,
+			Description: item.Description,
+		})
+	}
+	return result
+}
+
+func (s *HTTPRoutesServer) seriesPayload() ContentPayload {
+	snapshot := s.store.Current()
+	if snapshot.Catalog.Source.Mode == model.SourceModeM3UXMLTV {
+		return ContentPayload{Available: false, Reason: "M3U/XMLTV mode only exposes Live TV and guide data.", Items: []model.SeriesItem{}}
+	}
+	return ContentPayload{
+		Available:  len(snapshot.Catalog.Content.SeriesItems) > 0,
+		Categories: s.publicCategories(snapshot.Catalog.Content.SeriesCategories),
+		Items:      snapshot.Catalog.Content.SeriesItems,
+	}
+}
+
+func (s *HTTPRoutesServer) handleRecordings(ctx context.Context) (*pluginv1.HandleHTTPResponse, error) {
+	if !dvrEnabledForSource(s.store.Current().Catalog.Source.Mode) {
+		return s.respondJSON(http.StatusOK, RecordingsPayload{Available: false, Reason: "Recordings require Dispatcharr Direct Connect.", Items: []json.RawMessage{}})
+	}
+	client, err := s.dispatcharrClient()
+	if err != nil {
+		return s.respondJSON(http.StatusOK, RecordingsPayload{Available: false, Reason: err.Error(), Items: []json.RawMessage{}})
+	}
+	recordings, err := client.Recordings(ctx)
+	if err != nil {
+		return s.respondJSON(http.StatusBadGateway, RecordingsPayload{Available: false, Reason: err.Error(), Items: []json.RawMessage{}})
+	}
+	return s.respondJSON(http.StatusOK, RecordingsPayload{Available: true, Items: enrichRecordings(client, recordings)})
+}
+
+func (s *HTTPRoutesServer) handleRecordingCapability(ctx context.Context) (*pluginv1.HandleHTTPResponse, error) {
+	snapshot := s.store.Current()
+	if !dvrEnabledForSource(snapshot.Catalog.Source.Mode) {
+		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
+			Reason: "Recordings require Dispatcharr Direct Connect.",
+		})
+	}
+	if s.settingsProvider == nil {
+		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
+			Available: true,
+			Reason:    "Unable to verify Dispatcharr recording permissions.",
+		})
+	}
+	client, err := s.dispatcharrClient()
+	if err != nil {
+		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
+			Available: true,
+			Reason:    "Unable to verify Dispatcharr recording permissions.",
+		})
+	}
+	user, err := client.CurrentUser(ctx)
+	if err != nil {
+		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
+			Available: true,
+			Reason:    "Unable to verify Dispatcharr recording permissions.",
+		})
+	}
+	if user.UserLevel < 10 {
+		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
+			Available: true,
+			Reason:    "Scheduling requires a Dispatcharr admin account or Admin API Key.",
+		})
+	}
+	return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{Available: true, CanSchedule: true})
+}
+
+func (s *HTTPRoutesServer) handleScheduleRecording(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if !dvrEnabledForSource(s.store.Current().Catalog.Source.Mode) {
+		return textResponse(http.StatusConflict, "recordings require Dispatcharr Direct Connect"), nil
+	}
+	var payload scheduleRecordingRequest
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid recording payload"), nil
+	}
+	if strings.TrimSpace(payload.ChannelID) == "" {
+		return textResponse(http.StatusBadRequest, "missing channel id"), nil
+	}
+	if payload.EndUnix <= payload.StartUnix || payload.EndUnix <= 0 {
+		return textResponse(http.StatusBadRequest, "invalid recording window"), nil
+	}
+	if payload.StartUnix <= 0 {
+		return textResponse(http.StatusBadRequest, "missing recording start"), nil
+	}
+	channel, ok := s.channelByID(payload.ChannelID)
+	if !ok {
+		return textResponse(http.StatusNotFound, "channel not found"), nil
+	}
+	client, err := s.dispatcharrClient()
+	if err != nil {
+		return s.respondJSON(http.StatusOK, RecordingsPayload{Available: false, Reason: err.Error(), Items: []json.RawMessage{}})
+	}
+	dispatcharrChannelID, err := s.dispatcharrChannelID(ctx, client, channel)
+	if err != nil {
+		return textResponse(http.StatusBadGateway, err.Error()), nil
+	}
+	title := strings.TrimSpace(payload.Title)
+	if title == "" {
+		title = channel.Name
+	}
+	start := time.Unix(payload.StartUnix, 0).UTC()
+	end := time.Unix(payload.EndUnix, 0).UTC()
+	recording, err := client.CreateRecording(ctx, map[string]any{
+		"channel":    dispatcharrChannelID,
+		"start_time": start.Format(time.RFC3339),
+		"end_time":   end.Format(time.RFC3339),
+		"custom_properties": map[string]any{
+			"program": map[string]any{
+				"id":          strings.TrimSpace(payload.ProgramID),
+				"title":       title,
+				"description": strings.TrimSpace(payload.Description),
+				"start_time":  start.Format(time.RFC3339),
+				"end_time":    end.Format(time.RFC3339),
+				"tvg_id":      strings.TrimSpace(channel.GuideID),
+			},
+			"channel_name": channel.Name,
+			"source":       "silo.attmonk.dispatcharr",
+		},
+	})
+	if err != nil {
+		return scheduleRecordingErrorResponse(err), nil
+	}
+	return s.respondJSON(http.StatusOK, map[string]any{"ok": true, "recording": enrichRecording(client, recording)})
+}
+
+func scheduleRecordingErrorResponse(err error) *pluginv1.HandleHTTPResponse {
+	message := err.Error()
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "unexpected status 401") ||
+		strings.Contains(lower, "unexpected status 403") ||
+		strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "permission") {
+		return textResponse(http.StatusForbidden, "Dispatcharr requires an admin account or API key to schedule recordings.")
+	}
+	return textResponse(http.StatusBadGateway, message)
+}
+
+func (s *HTTPRoutesServer) handlePreferences(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	return userStateUnavailableResponse(), nil
+}
+
+func (s *HTTPRoutesServer) handleAdminSettings(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() == http.MethodPost && !s.adminSettingsAuthorized(request) {
+		return textResponse(http.StatusForbidden, "Silo administrator access is required"), nil
+	}
+	if request.GetMethod() != http.MethodPost {
+		if s.adminStorage != nil {
+			saved, ok, err := s.adminStorage.Load()
+			if err != nil {
+				log.Printf("dispatcharr: load admin settings file failed: %v", err)
+				return textResponse(http.StatusInternalServerError, "could not load admin settings"), nil
+			}
+			if ok {
+				s.store.SetAdminSettings(saved)
+				return s.respondAdminSettings(request, saved)
+			}
+		}
+		if s.store.HasAdminSettings() {
+			return s.respondAdminSettings(request, s.store.AdminSettings())
+		}
+		if s.settingsProvider != nil {
+			if configured := s.settingsProvider().AdminSettings; len(configured) > 0 {
+				return s.respondAdminSettings(request, configured)
+			}
+		}
+		return s.respondAdminSettings(request, s.store.AdminSettings())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid admin settings payload"), nil
+	}
+	normalized := normalizeAdminSettingsPayload(payload)
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return textResponse(http.StatusBadRequest, "invalid admin settings payload"), nil
+	}
+	if s.adminStorage != nil {
+		if err := s.adminStorage.Save(encoded); err != nil {
+			log.Printf("dispatcharr: save admin settings file failed: %v", err)
+			return textResponse(http.StatusInternalServerError, "could not save admin settings"), nil
+		}
+	}
+	persistCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := s.persistAdminSettings(persistCtx, normalized); err != nil {
+		log.Printf("dispatcharr: persist admin plugin settings failed: %v", err)
+		return textResponse(http.StatusBadGateway, "could not save plugin settings"), nil
+	}
+	saved := s.store.SetAdminSettings(encoded)
+	s.sportsPreparedMu.Lock()
+	s.sportsPrepared.ExpiresAfter = time.Time{}
+	s.sportsPreparedMu.Unlock()
+	return s.respondJSON(http.StatusOK, json.RawMessage(saved))
+}
+
+type adminSourcePayload struct {
+	ID                  string                `json:"id"`
+	Name                string                `json:"name"`
+	BaseURL             string                `json:"baseUrl"`
+	Username            string                `json:"username"`
+	Password            string                `json:"password,omitempty"`
+	LiveFormat          string                `json:"liveFormat"`
+	HLSBufferSeconds    int                   `json:"hlsBufferSeconds"`
+	Enabled             bool                  `json:"enabled"`
+	PasswordConfigured  bool                  `json:"passwordConfigured"`
+	ChannelCount        int                   `json:"channelCount"`
+	AlternateEPGEnabled bool                  `json:"alternateEpgEnabled"`
+	AlternateEPGURL     string                `json:"alternateEpgUrl,omitempty"`
+	AlternateEPGPolicy  string                `json:"alternateEpgPolicy"`
+	Action              string                `json:"action,omitempty"`
+	AccountID           string                `json:"accountId,omitempty"`
+	CatalogAccountID    string                `json:"catalogAccountId,omitempty"`
+	Accounts            []adminAccountPayload `json:"accounts,omitempty"`
+}
+
+type adminAccountPayload struct {
+	ID                 string `json:"id"`
+	Name               string `json:"name,omitempty"`
+	Username           string `json:"username"`
+	Password           string `json:"password,omitempty"`
+	Enabled            bool   `json:"enabled"`
+	Catalog            bool   `json:"catalog,omitempty"`
+	Compatible         bool   `json:"compatible,omitempty"`
+	ConnectionLimit    int    `json:"connectionLimit,omitempty"`
+	ActiveConnections  int    `json:"activeConnections"`
+	PasswordConfigured bool   `json:"passwordConfigured"`
+}
+
+type alternateEPGTestPayload = matching.AlternateEPGCoverage
+
+func (s *HTTPRoutesServer) handleAdminSources(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if !s.canManageCatalog(request) {
+		return textResponse(http.StatusForbidden, "Silo admin role required"), nil
+	}
+	if s.sourceRegistry == nil || s.settingsProvider == nil {
+		return textResponse(http.StatusServiceUnavailable, "source registry unavailable"), nil
+	}
+	if request.GetMethod() == http.MethodGet {
+		sources, err := s.adminSourceList(ctx)
+		if err != nil {
+			return textResponse(http.StatusInternalServerError, "could not load source registry"), nil
+		}
+		return s.respondJSON(http.StatusOK, map[string]any{"sources": sources})
+	}
+	if request.GetMethod() != http.MethodPost && request.GetMethod() != http.MethodDelete {
+		return textResponse(http.StatusMethodNotAllowed, "source manager requires GET, POST, or DELETE"), nil
+	}
+	var payload adminSourcePayload
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid source payload"), nil
+	}
+	// One route server owns each shared or per-user registry. Keep its complete
+	// read/modify/write operation serialized, including legacy migration.
+	s.sourceMutationMu.Lock()
+	defer s.sourceMutationMu.Unlock()
+	sources, err := s.mutableSourceRegistry()
+	if err != nil {
+		return textResponse(http.StatusInternalServerError, "could not load source registry"), nil
+	}
+	index := -1
+	for sourceIndex := range sources {
+		if sources[sourceIndex].ID == config.NormalizeSourceID(payload.ID) {
+			index = sourceIndex
+			break
+		}
+	}
+	if request.GetMethod() == http.MethodDelete || payload.Action == "delete" {
+		if index < 0 {
+			return textResponse(http.StatusNotFound, "source not found"), nil
+		}
+		sources = append(sources[:index], sources[index+1:]...)
+		if err := s.sourceRegistry.Save(sources); err != nil {
+			return textResponse(http.StatusBadRequest, err.Error()), nil
+		}
+		s.queueSourceRefresh()
+		return s.respondAdminSourceList(ctx)
+	}
+	password := payload.Password
+	if password == "" && index >= 0 {
+		password = sources[index].Password
+	}
+	identityUsername := strings.TrimSpace(payload.Username)
+	if identityUsername == "" {
+		for _, account := range payload.Accounts {
+			if account.Catalog || payload.CatalogAccountID == account.ID {
+				identityUsername = account.Username
+				break
+			}
+		}
+	}
+	sourceID := config.DeriveXtreamSourceID(payload.BaseURL, identityUsername)
+	if index >= 0 {
+		sourceID = sources[index].ID
+	}
+	accounts := make([]config.XtreamAccount, 0, len(payload.Accounts))
+	for _, accountPayload := range payload.Accounts {
+		accountPassword := accountPayload.Password
+		if accountPassword == "" && index >= 0 {
+			for _, existing := range sources[index].Accounts {
+				if existing.ID == config.NormalizeSourceID(accountPayload.ID) {
+					accountPassword = existing.Password
+					break
+				}
+			}
+			if accountPassword == "" && (accountPayload.Catalog || payload.CatalogAccountID == accountPayload.ID) {
+				accountPassword = sources[index].Password
+			}
+		}
+		accounts = append(accounts, config.XtreamAccount{ID: accountPayload.ID, Name: accountPayload.Name, Username: accountPayload.Username, Password: accountPassword, Enabled: accountPayload.Enabled, Catalog: accountPayload.Catalog, Compatible: accountPayload.Compatible, ConnectionLimit: accountPayload.ConnectionLimit})
+	}
+	if len(accounts) == 0 && index >= 0 && len(sources[index].Accounts) > 0 {
+		accounts = sources[index].Accounts
+	}
+	candidate, err := config.NormalizeXtreamSource(config.XtreamSource{ID: sourceID, Name: payload.Name, BaseURL: payload.BaseURL, Username: payload.Username, Password: password, LiveFormat: payload.LiveFormat, HLSBufferSeconds: payload.HLSBufferSeconds, Enabled: payload.Enabled, AlternateEPGEnabled: payload.AlternateEPGEnabled, AlternateEPGURL: payload.AlternateEPGURL, AlternateEPGPolicy: payload.AlternateEPGPolicy, CatalogAccountID: payload.CatalogAccountID, Accounts: accounts})
+	if err != nil {
+		return textResponse(http.StatusBadRequest, err.Error()), nil
+	}
+	if payload.Action == "test" {
+		testCtx, cancel := context.WithTimeout(ctx, adminSourceConnectionTestTimeout)
+		defer cancel()
+		if err := s.xtreamClient(candidate.BaseURL, candidate.Username, candidate.Password).TestConnection(testCtx); err != nil {
+			return textResponse(http.StatusBadGateway, "connection test failed: "+err.Error()), nil
+		}
+		return s.respondJSON(http.StatusOK, map[string]any{"connected": true})
+	}
+	if payload.Action == "test_account" {
+		accountID := config.NormalizeSourceID(payload.AccountID)
+		var account config.XtreamAccount
+		found := false
+		for _, candidateAccount := range candidate.Accounts {
+			if candidateAccount.ID == accountID {
+				account = candidateAccount
+				found = true
+				break
+			}
+		}
+		if !found {
+			return textResponse(http.StatusBadRequest, "playback account not found"), nil
+		}
+		testCtx, cancel := context.WithTimeout(ctx, adminSourceConnectionTestTimeout)
+		defer cancel()
+		if err := s.xtreamClient(candidate.BaseURL, account.Username, account.Password).TestConnection(testCtx); err != nil {
+			return textResponse(http.StatusBadGateway, "account test failed: "+err.Error()), nil
+		}
+		return s.respondJSON(http.StatusOK, map[string]any{"connected": true, "compatible": true, "accountId": account.ID})
+	}
+	if payload.Action == "test_epg" {
+		if !candidate.AlternateEPGEnabled {
+			return textResponse(http.StatusBadRequest, "enable alternate EPG before testing"), nil
+		}
+		channels := make([]model.Channel, 0)
+		for _, channel := range s.store.Current().Catalog.Channels {
+			if adminChannelSourceID(channel, []config.XtreamSource{candidate}) == candidate.ID {
+				channels = append(channels, channel)
+			}
+		}
+		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		coverage, err := s.sourceEPGTester(testCtx, candidate, channels)
+		if err != nil {
+			return textResponse(http.StatusBadGateway, "alternate EPG test failed: "+err.Error()), nil
+		}
+		return s.respondJSON(http.StatusOK, map[string]any{"connected": true, "coverage": coverage})
+	}
+	if index >= 0 {
+		sources[index] = candidate
+	} else {
+		sources = append(sources, candidate)
+	}
+	if err := s.sourceRegistry.Save(sources); err != nil {
+		return textResponse(http.StatusBadRequest, err.Error()), nil
+	}
+	s.queueSourceRefresh()
+	return s.respondAdminSourceList(ctx)
+}
+
+func (s *HTTPRoutesServer) mutableSourceRegistry() ([]config.XtreamSource, error) {
+	sources, err := s.sourceRegistry.Load()
+	if err != nil {
+		return nil, err
+	}
+	// A non-nil empty slice means XC Admin intentionally saved an empty
+	// registry. Do not resurrect legacy settings after the last source is
+	// removed; nil is reserved for a registry file that does not exist yet.
+	if sources != nil {
+		return sources, nil
+	}
+	settings := s.settingsProvider()
+	if len(settings.XtreamSources) > 0 {
+		return settings.EffectiveXtreamSources(), nil
+	}
+	if strings.TrimSpace(settings.XtreamBaseURL) == "" || strings.TrimSpace(settings.XtreamUsername) == "" || strings.TrimSpace(settings.XtreamPassword) == "" {
+		return nil, nil
+	}
+	return settings.EffectiveXtreamSources(), nil
+}
+
+func (s *HTTPRoutesServer) adminSourceList(ctx context.Context) ([]adminSourcePayload, error) {
+	sources, err := s.mutableSourceRegistry()
+	if err != nil {
+		return nil, err
+	}
+	counts := map[string]int{}
+	for _, channel := range s.store.Current().Catalog.Channels {
+		if sourceID := adminChannelSourceID(channel, sources); sourceID != "" {
+			counts[sourceID]++
+		}
+	}
+	result := make([]adminSourcePayload, 0, len(sources))
+	for _, source := range sources {
+		if normalized, normalizeErr := config.NormalizeXtreamSource(source); normalizeErr == nil {
+			source = normalized
+		}
+		usage := s.accountPool.Usage(source.ID)
+		accounts := make([]adminAccountPayload, 0, len(source.Accounts))
+		for _, account := range source.Accounts {
+			accounts = append(accounts, adminAccountPayload{ID: account.ID, Name: account.Name, Username: account.Username, Enabled: account.Enabled, Catalog: account.Catalog, Compatible: account.Compatible, ConnectionLimit: account.ConnectionLimit, ActiveConnections: usage[account.ID], PasswordConfigured: account.Password != ""})
+		}
+		result = append(result, adminSourcePayload{ID: source.ID, Name: source.Name, BaseURL: source.BaseURL, Username: source.Username, LiveFormat: source.EffectiveLiveFormat(), HLSBufferSeconds: source.EffectiveHLSBufferSeconds(), Enabled: source.Enabled, PasswordConfigured: source.Password != "", ChannelCount: counts[source.ID], AlternateEPGEnabled: source.AlternateEPGEnabled, AlternateEPGURL: source.AlternateEPGURL, AlternateEPGPolicy: source.EffectiveAlternateEPGPolicy(), CatalogAccountID: source.CatalogAccountID, Accounts: accounts})
+	}
+	return result, nil
+}
+
+func (s *HTTPRoutesServer) xtreamClient(baseURL, username, password string) *xtream.Client {
+	return xtream.NewClientWithHTTP(baseURL, username, password, s.upstreamClient)
+}
+
+func testAlternateEPGSource(ctx context.Context, source config.XtreamSource, channels []model.Channel) (alternateEPGTestPayload, error) {
+	return testAlternateEPGSourceWith(ctx, &http.Client{Timeout: 30 * time.Second}, source, channels)
+}
+
+func testAlternateEPGSourceWith(ctx context.Context, client *http.Client, source config.XtreamSource, channels []model.Channel) (alternateEPGTestPayload, error) {
+	// Alternate EPG URLs can embed credentials (Xtream xmltv.php query
+	// parameters), so url.Error values are redacted before they reach the
+	// admin UI or logs.
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.AlternateEPGURL, nil)
+	if err != nil {
+		return alternateEPGTestPayload{}, sharedhttp.RedactErrorURL(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return alternateEPGTestPayload{}, sharedhttp.RedactErrorURL(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return alternateEPGTestPayload{}, fmt.Errorf("unexpected status %d", response.StatusCode)
+	}
+	doc, err := xmltv.ParseReader(response.Body, xmltv.ParseOptions{MaxBytes: sharedhttp.MaxCatalogResponseBytes})
+	if err != nil {
+		return alternateEPGTestPayload{}, fmt.Errorf("parse XMLTV: %w", sharedhttp.RedactErrorURL(err))
+	}
+	matched := matching.MatchAlternateEPGChannels(channels, doc)
+	return matched.Coverage(doc), nil
+}
+
+func adminChannelSourceID(channel model.Channel, sources []config.XtreamSource) string {
+	if sourceID := strings.TrimPrefix(strings.TrimSpace(channel.SourceID), "xtream-source:"); sourceID != "" {
+		return sourceID
+	}
+	channelID := strings.TrimSpace(channel.ID)
+	for _, source := range sources {
+		if source.ID != "primary" && strings.HasPrefix(channelID, "xtream:"+source.ID+":") {
+			return source.ID
+		}
+	}
+	if strings.HasPrefix(channelID, "xtream:") {
+		for _, source := range sources {
+			if source.ID == "primary" {
+				return source.ID
+			}
+		}
+	}
+	if len(sources) == 1 {
+		return sources[0].ID
+	}
+	return ""
+}
+
+func (s *HTTPRoutesServer) respondAdminSourceList(ctx context.Context) (*pluginv1.HandleHTTPResponse, error) {
+	sources, err := s.adminSourceList(ctx)
+	if err != nil {
+		return textResponse(http.StatusInternalServerError, "could not load source registry"), nil
+	}
+	return s.respondJSON(http.StatusOK, map[string]any{"sources": sources})
+}
+
+func (s *HTTPRoutesServer) queueSourceRefresh() {
+	if s.coordinator == nil || s.settingsProvider == nil {
+		return
+	}
+	s.coordinator.Start(RefreshCatalog, s.settingsProvider())
+}
+
+func (s *HTTPRoutesServer) respondAdminSettings(request *pluginv1.HandleHTTPRequest, settings json.RawMessage) (*pluginv1.HandleHTTPResponse, error) {
+	if s.adminSettingsAuthorized(request) {
+		return s.respondJSON(http.StatusOK, settings)
+	}
+	var public map[string]any
+	if err := json.Unmarshal(settings, &public); err != nil {
+		return textResponse(http.StatusInternalServerError, "invalid saved admin settings"), nil
+	}
+	public["ecmEnabled"] = false
+	public["ecmURL"] = ""
+	return s.respondJSON(http.StatusOK, public)
+}
+
+func (s *HTTPRoutesServer) adminSettingsAuthorized(request *pluginv1.HandleHTTPRequest) bool {
+	return requestIsAdmin(request)
+}
+
+// canManageCatalog reports whether the caller may change this server's sources
+// and force its refreshes: an admin on the shared server, or the owner on a
+// per-user tenant (the router only sends a tenant its own user's requests).
+func (s *HTTPRoutesServer) canManageCatalog(request *pluginv1.HandleHTTPRequest) bool {
+	if s.tenantUserID != "" {
+		return true
+	}
+	return requestIsAdmin(request)
+}
+
+// requestIsAdmin reports whether the Silo host identified the caller as an
+// admin. X-Silo-User-Role is trustworthy: the host's plugin HTTP proxy only
+// forwards an allowlist of client headers (accept, content-type, range, ...)
+// and stamps the X-Silo-User-* identity headers itself after authenticating
+// the session, so a browser cannot inject or override this value.
+func requestIsAdmin(request *pluginv1.HandleHTTPRequest) bool {
+	return strings.EqualFold(strings.TrimSpace(headerValue(request.GetHeaders(), "x-silo-user-role")), "admin")
+}
+
+// adminRequiredResponse is the JSON 403 returned when a non-admin calls an
+// admin-only action (force refresh, channel refresh).
+func adminRequiredResponse(action string) (*pluginv1.HandleHTTPResponse, error) {
+	body, err := json.Marshal(map[string]any{
+		"ok":      false,
+		"error":   "admin_required",
+		"message": "Only Silo admins can perform this action: " + action + ".",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: http.StatusForbidden,
+		Headers: map[string]string{
+			"cache-control": "no-store",
+			"content-type":  "application/json",
+		},
+		Body: body,
+	}, nil
+}
+
+func headerValue(headers map[string]string, key string) string {
+	for name, value := range headers {
+		if strings.EqualFold(name, key) {
+			return value
+		}
+	}
+	return ""
+}
+
+func (s *HTTPRoutesServer) persistAdminSettings(ctx context.Context, payload map[string]any) error {
+	if s.adminPersister == nil {
+		return nil
+	}
+	return s.adminPersister(ctx, payload)
+}
+
+func (s *HTTPRoutesServer) handleFavorite(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	return userStateUnavailableResponse(), nil
+}
+
+func (s *HTTPRoutesServer) handleHiddenCategory(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	return userStateUnavailableResponse(), nil
+}
+
+func (s *HTTPRoutesServer) handlePlaybackSettings(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	return userStateUnavailableResponse(), nil
+}
+
+func userStateUnavailableResponse() *pluginv1.HandleHTTPResponse {
+	return textResponse(http.StatusGone, "user state is stored in the Silo user profile")
+}
+
+func (s *HTTPRoutesServer) handleWatchStart(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() != http.MethodPost {
+		return textResponse(http.StatusMethodNotAllowed, "method not allowed"), nil
+	}
+	var payload watchRequest
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid watch payload"), nil
+	}
+	if strings.TrimSpace(payload.ItemID) == "" {
+		return textResponse(http.StatusBadRequest, "missing itemId"), nil
+	}
+	if strings.TrimSpace(payload.ItemKind) == "" {
+		payload.ItemKind = "channel"
+	}
+	session := s.store.StartWatch(payload.ItemKind, payload.ItemID, payload.ItemName)
+	if err := s.reserveMappedWatch(payload.ItemID, session.ID); err != nil {
+		_, _ = s.store.StopWatch(session.ID, "account_pool_full")
+		return textResponse(http.StatusConflict, err.Error()), nil
+	}
+
+	s.watchOwnerMu.Lock()
+	if s.watchOwners == nil {
+		s.watchOwners = map[string]string{}
+	}
+	if s.watchSeen == nil {
+		s.watchSeen = map[string]time.Time{}
+	}
+	for id, seen := range s.watchSeen {
+		if time.Since(seen) > 2*time.Minute {
+			delete(s.watchSeen, id)
+			delete(s.watchOwners, id)
+			delete(s.watchBindings, id)
+		}
+	}
+	s.watchOwners[session.ID] = mediaweb.Owner(request)
+	s.watchSeen[session.ID] = time.Now()
+	s.watchOwnerMu.Unlock()
+	return s.respondJSON(http.StatusOK, map[string]any{"session": session})
+}
+
+func (s *HTTPRoutesServer) handleWatchHeartbeat(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() != http.MethodPost {
+		return textResponse(http.StatusMethodNotAllowed, "method not allowed"), nil
+	}
+	var payload watchRequest
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid watch payload"), nil
+	}
+	s.watchOwnerMu.Lock()
+	current, known := s.watchOwners[payload.SessionID]
+	if known && current != mediaweb.Owner(request) {
+		s.watchOwnerMu.Unlock()
+		return textResponse(403, "watch session belongs to another viewer"), nil
+	}
+	if known {
+		s.watchSeen[payload.SessionID] = time.Now()
+	}
+	s.watchOwnerMu.Unlock()
+
+	session, ok := s.store.HeartbeatWatch(payload.SessionID)
+	if !ok {
+		return textResponse(http.StatusNotFound, "watch session not found"), nil
+	}
+	s.accountPool.Touch(payload.SessionID)
+	return s.respondJSON(http.StatusOK, map[string]any{"session": session})
+}
+
+func (s *HTTPRoutesServer) handleWatchStop(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if request.GetMethod() != http.MethodPost {
+		return textResponse(http.StatusMethodNotAllowed, "method not allowed"), nil
+	}
+	var payload watchRequest
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid watch payload"), nil
+	}
+	s.watchOwnerMu.Lock()
+	current, known := s.watchOwners[payload.SessionID]
+	if known && current != mediaweb.Owner(request) {
+		s.watchOwnerMu.Unlock()
+		return textResponse(403, "watch session belongs to another viewer"), nil
+	}
+	if known {
+		s.watchSeen[payload.SessionID] = time.Now()
+	}
+	s.watchOwnerMu.Unlock()
+
+	session, ok := s.store.StopWatch(payload.SessionID, payload.Reason)
+	if !ok {
+		return textResponse(http.StatusNotFound, "watch session not found"), nil
+	}
+	s.mediaController().StopReservation(mediaweb.Owner(request), payload.SessionID)
+	s.watchOwnerMu.Lock()
+	delete(s.watchOwners, payload.SessionID)
+	delete(s.watchSeen, payload.SessionID)
+	s.watchOwnerMu.Unlock()
+	s.accountPool.Release(payload.SessionID)
+	return s.respondJSON(http.StatusOK, map[string]any{"session": session})
+}
+
+func (s *HTTPRoutesServer) respondJSON(status int, value any) (*pluginv1.HandleHTTPResponse, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: int32(status),
+		Headers: map[string]string{
+			"cache-control": "no-store",
+			"content-type":  "application/json",
+		},
+		Body: payload,
+	}, nil
+}
+
+func playerLibraryAssetResponse(path string) (*pluginv1.HandleHTTPResponse, error) {
+	payload, err := playerAssets.ReadFile(path)
+	if err != nil {
+		return textResponse(http.StatusNotFound, "asset not found"), nil
+	}
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: http.StatusOK,
+		Headers: map[string]string{
+			"cache-control": "public, max-age=31536000, immutable",
+			"content-type":  "application/javascript; charset=utf-8",
+		},
+		Body: payload,
+	}, nil
+}
+
+func playerUIAssetResponse(path string, contentType string) (*pluginv1.HandleHTTPResponse, error) {
+	payload, err := playerUIAssets.ReadFile(path)
+	if err != nil {
+		return textResponse(http.StatusNotFound, "asset not found"), nil
+	}
+	return textAssetResponse(payload, contentType)
+}
+
+func textAssetResponse(payload []byte, contentType string) (*pluginv1.HandleHTTPResponse, error) {
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: http.StatusOK,
+		Headers: map[string]string{
+			"cache-control": "public, max-age=31536000, immutable",
+			"content-type":  contentType,
+		},
+		Body: payload,
+	}, nil
+}
+
+func (s *HTTPRoutesServer) playerPageHTML(request *pluginv1.HandleHTTPRequest) string {
+	body := strings.Replace(playerPageHTMLTemplate, "__SILO_THEME__", html.EscapeString(sanitizeThemeSlug(queryValue(request, "theme"))), 1)
+	assetPrefix := "assets"
+	if request.GetPath() == "/xtream" {
+		assetPrefix = "xtream/assets"
+	}
+	body = strings.ReplaceAll(body, "__ASSET_PREFIX__", assetPrefix)
+	body = strings.ReplaceAll(body, "__ASSET_VERSION__", pluginAssetVersion())
+	if request.GetPath() == "/dispatcharr/admin" || request.GetPath() == "/xtream/admin" {
+		body = removeTemplateBlock(body, "<!-- USER_NAV_START -->", "<!-- USER_NAV_END -->")
+		body = replaceTemplateBlock(body, "<!-- USER_TOPBAR_START -->", "<!-- USER_TOPBAR_END -->", adminTopbarHTML())
+		body = strings.Replace(body, "__APP_TITLE__", "XC Admin", 2)
+		return strings.Replace(body, "__ROUTE_CLASS__", "is-admin", 1)
+	}
+	body = strings.Replace(body, "__APP_TITLE__", "Live TV (XC)", 2)
+	return strings.Replace(body, "__ROUTE_CLASS__", "", 1)
+}
+
+func pluginAssetVersion() string {
+	assetVersionOnce.Do(func() {
+		hash := sha256.New()
+		for _, asset := range []struct {
+			fs   interface{ ReadFile(string) ([]byte, error) }
+			path string
+		}{
+			{playerUIAssets, "ui/styles.css"},
+			{playerUIAssets, "ui/lineup.js"},
+			{playerUIAssets, "ui/app.js"},
+			{playerAssets, "assets/hls.min.js"},
+			{playerAssets, "assets/mpegts.min.js"},
+		} {
+			if payload, err := asset.fs.ReadFile(asset.path); err == nil {
+				_, _ = hash.Write(payload)
+			}
+		}
+		assetVersionValue = hex.EncodeToString(hash.Sum(nil))[:16]
+	})
+	return assetVersionValue
+}
+
+func removeTemplateBlock(body string, startMarker string, endMarker string) string {
+	return replaceTemplateBlock(body, startMarker, endMarker, "")
+}
+
+func replaceTemplateBlock(body string, startMarker string, endMarker string, replacement string) string {
+	start := strings.Index(body, startMarker)
+	if start < 0 {
+		return body
+	}
+	end := strings.Index(body[start:], endMarker)
+	if end < 0 {
+		return body
+	}
+	end += start + len(endMarker)
+	return body[:start] + replacement + body[end:]
+}
+
+func adminTopbarHTML() string {
+	return `<aside class="admin-sidebar"><a class="admin-brand" href="/admin"><span class="admin-brand-mark"><i></i><i></i><i></i></span><strong>Silo</strong></a><div class="admin-sidebar-label">XC Admin</div><nav id="admin-tabs" class="admin-sidebar-nav" aria-label="XC Admin sections"></nav><div class="admin-sidebar-spacer"></div><a class="admin-sidebar-link" href="../xtream"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 6.75A2.25 2.25 0 0 1 6.75 4.5h10.5A2.25 2.25 0 0 1 19.5 6.75v10.5a2.25 2.25 0 0 1-2.25 2.25H6.75a2.25 2.25 0 0 1-2.25-2.25V6.75Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M9 9.25v5.5l5-2.75-5-2.75Z"/></svg><span>Open Live TV</span></a><a class="admin-sidebar-link" href="/admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5"/></svg><span>Back to Admin</span></a></aside><header class="admin-topbar"><div class="admin-identity"><div><h1>XC Admin</h1><p>Manage IPTV sources and organize the Live TV catalog.</p></div></div><div id="admin-actions" class="admin-actions"></div></header>`
+}
+
+func sanitizeThemeSlug(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return -1
+	}, value)
+}
+
+func (s *HTTPRoutesServer) resolveStreamURL(channelID, sessionID string) (string, error) {
+	return s.resolveChannelStreamURL(channelID, sessionID, "")
+}
+
+// resolveChannelStreamURL resolves a channel with an explicit live extension
+// ("ts" or "m3u8"; empty keeps the source's own format). Without a sessionID it
+// uses the source's catalog account; with one it leases a playback account
+// from the pool for that session.
+func (s *HTTPRoutesServer) resolveChannelStreamURL(channelID, sessionID, ext string) (string, error) {
+	snapshot := s.store.Current()
+	for _, channel := range snapshot.Catalog.Channels {
+		if channel.ID != channelID {
+			continue
+		}
+		if strings.HasPrefix(channel.ID, "xtream:") && s.settingsProvider != nil {
+			sourceID, streamID, err := parseScopedXtreamID(channel.ID, "xtream:")
+			if err != nil {
+				return "", fmt.Errorf("invalid xtream channel id")
+			}
+			settings := s.settingsProvider()
+			source, ok := settings.XtreamSourceByID(sourceID)
+			if !ok {
+				return "", fmt.Errorf("xtream source is unavailable")
+			}
+			account, ok := source.EffectiveCatalogAccount()
+			if !ok {
+				return "", fmt.Errorf("xtream catalog account is unavailable")
+			}
+			if strings.TrimSpace(sessionID) != "" {
+				account, err = s.accountPool.Lease(sessionID, source)
+				if err != nil {
+					return "", err
+				}
+			}
+			if ext == "" {
+				ext = source.EffectiveLiveFormat()
+			}
+			client := s.xtreamClient(source.BaseURL, account.Username, account.Password)
+			streamURL := client.ResolveLiveStreamURLWithExtension(streamID, ext)
+			if strings.TrimSpace(streamURL) == "" {
+				return "", fmt.Errorf("unable to resolve stream url")
+			}
+			return streamURL, nil
+		}
+		if strings.TrimSpace(channel.StreamURL) != "" {
+			return channel.StreamURL, nil
+		}
+		return "", fmt.Errorf("stream url unavailable for channel")
+	}
+	return "", fmt.Errorf("channel not found")
+}
+
+func (s *HTTPRoutesServer) xtreamSourceForItem(itemID string) (config.XtreamSource, bool) {
+	if s.settingsProvider == nil || !strings.HasPrefix(strings.TrimSpace(itemID), "xtream:") {
+		return config.XtreamSource{}, false
+	}
+	sourceID, _, err := parseScopedXtreamID(itemID, "xtream:")
+	if err != nil {
+		return config.XtreamSource{}, false
+	}
+	settings := s.settingsProvider()
+	if settings.EffectiveSourceMode() != config.SourceModeXtream {
+		return config.XtreamSource{}, false
+	}
+	return settings.XtreamSourceByID(sourceID)
+}
+
+func (s *HTTPRoutesServer) resolveVODStreamURL(_ context.Context, itemID string) (string, error) {
+	snapshot := s.store.Current()
+	for _, item := range snapshot.Catalog.Content.VODItems {
+		if item.ID != itemID {
+			continue
+		}
+		if strings.TrimSpace(item.StreamURL) != "" {
+			return item.StreamURL, nil
+		}
+		if !strings.HasPrefix(item.ID, "vod:") || s.settingsProvider == nil {
+			return "", fmt.Errorf("stream url unavailable for item")
+		}
+		sourceID, streamID, err := parseScopedXtreamID(item.ID, "vod:")
+		if err != nil {
+			return "", fmt.Errorf("invalid vod item id")
+		}
+		settings := s.settingsProvider()
+		source, ok := settings.XtreamSourceByID(sourceID)
+		if !ok {
+			return "", fmt.Errorf("xtream source is unavailable")
+		}
+		client := s.xtreamClient(source.BaseURL, source.Username, source.Password)
+		streamURL := client.ResolveVODStreamURL(streamID, item.Container)
+		if strings.TrimSpace(streamURL) == "" {
+			return "", fmt.Errorf("unable to resolve vod stream url")
+		}
+		return streamURL, nil
+	}
+	return "", fmt.Errorf("vod item not found")
+}
+
+func (s *HTTPRoutesServer) resolveEpisodeStreamURL(ctx context.Context, seriesIDValue, episodeIDValue string) (string, error) {
+	if s.settingsProvider == nil {
+		return "", fmt.Errorf("source settings are unavailable")
+	}
+	sourceID, seriesID, err := parseScopedXtreamID(seriesIDValue, "series:")
+	if err != nil || seriesID <= 0 {
+		return "", fmt.Errorf("invalid series id")
+	}
+	episodeID, err := strconv.ParseInt(strings.TrimPrefix(episodeIDValue, "episode:"), 10, 64)
+	if err != nil || episodeID <= 0 {
+		return "", fmt.Errorf("invalid episode id")
+	}
+	settings := s.settingsProvider()
+	if settings.EffectiveSourceMode() != config.SourceModeXtream {
+		return "", fmt.Errorf("episode playback is available only for Xtream Codes")
+	}
+	source, ok := settings.XtreamSourceByID(sourceID)
+	if !ok {
+		return "", fmt.Errorf("xtream source is unavailable")
+	}
+	client := s.xtreamClient(source.BaseURL, source.Username, source.Password)
+	info, err := client.SeriesInfo(ctx, seriesID)
+	if err != nil {
+		return "", fmt.Errorf("series information is unavailable")
+	}
+	for _, episode := range info.Episodes {
+		if episode.ID == episodeID {
+			if target := client.ResolveEpisodeStreamURL(episode); target != "" {
+				return target, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("episode not found")
+}
+
+func parseScopedXtreamID(value, prefix string) (string, int64, error) {
+	value = strings.TrimPrefix(strings.TrimSpace(value), prefix)
+	parts := strings.Split(value, ":")
+	sourceID := "primary"
+	numeric := value
+	if len(parts) == 2 {
+		sourceID = parts[0]
+		numeric = parts[1]
+	} else if len(parts) != 1 {
+		return "", 0, fmt.Errorf("invalid scoped xtream id")
+	}
+	id, err := strconv.ParseInt(numeric, 10, 64)
+	if err != nil || id <= 0 {
+		return "", 0, fmt.Errorf("invalid scoped xtream id")
+	}
+	return sourceID, id, nil
+}
+
+func (s *HTTPRoutesServer) dispatcharrClient() (*dispatcharr.Client, error) {
+	if s.settingsProvider == nil {
+		return nil, fmt.Errorf("dispatcharr settings are unavailable")
+	}
+	settings := s.settingsProvider()
+	switch settings.EffectiveSourceMode() {
+	case config.SourceModeDirectLogin:
+		if strings.TrimSpace(settings.DispatcharrURL) == "" || strings.TrimSpace(settings.DispatcharrUser) == "" || strings.TrimSpace(settings.DispatcharrPass) == "" {
+			return nil, fmt.Errorf("dispatcharr direct login settings are incomplete")
+		}
+		return dispatcharr.NewLoginClient(settings.DispatcharrURL, settings.DispatcharrUser, settings.DispatcharrPass), nil
+	case config.SourceModeAPIKey:
+		if strings.TrimSpace(settings.DispatcharrURL) == "" || strings.TrimSpace(settings.DispatcharrAPIKey) == "" {
+			return nil, fmt.Errorf("dispatcharr api key settings are incomplete")
+		}
+		return dispatcharr.NewAPIKeyClient(settings.DispatcharrURL, settings.DispatcharrAPIKey), nil
+	default:
+		return nil, fmt.Errorf("recordings require Dispatcharr direct or API key mode")
+	}
+}
+
+func (s *HTTPRoutesServer) channelByID(channelID string) (model.Channel, bool) {
+	snapshot := s.store.Current()
+	for _, channel := range snapshot.Catalog.Channels {
+		if channel.ID == channelID {
+			return channel, true
+		}
+	}
+	return model.Channel{}, false
+}
+
+func (s *HTTPRoutesServer) dispatcharrChannelID(ctx context.Context, client *dispatcharr.Client, channel model.Channel) (int, error) {
+	upstreamChannels, err := client.Channels(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("load Dispatcharr channels: %w", err)
+	}
+	streamUUID := dispatcharrStreamUUID(channel.StreamURL)
+	for _, upstream := range upstreamChannels {
+		if streamUUID != "" && strings.EqualFold(upstream.UUID.String(), streamUUID) {
+			return strconv.Atoi(upstream.ID.String())
+		}
+	}
+	for _, upstream := range upstreamChannels {
+		if channel.GuideID != "" && strings.EqualFold(upstream.EffectiveTVGID.String(), channel.GuideID) {
+			return strconv.Atoi(upstream.ID.String())
+		}
+		if channel.GuideID != "" && strings.EqualFold(upstream.TVGID.String(), channel.GuideID) {
+			return strconv.Atoi(upstream.ID.String())
+		}
+	}
+	for _, upstream := range upstreamChannels {
+		name := strings.TrimSpace(channel.Name)
+		if name != "" && strings.EqualFold(upstream.EffectiveName.String(), name) {
+			return strconv.Atoi(upstream.ID.String())
+		}
+		if name != "" && strings.EqualFold(upstream.Name.String(), name) {
+			return strconv.Atoi(upstream.ID.String())
+		}
+	}
+	return 0, fmt.Errorf("unable to match %q to a Dispatcharr channel", channel.Name)
+}
+
+func dispatcharrStreamUUID(streamURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(streamURL))
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) < 1 {
+		return ""
+	}
+	for index := 0; index < len(parts)-1; index++ {
+		if parts[index] == "stream" {
+			return parts[index+1]
+		}
+	}
+	return ""
+}
+
+func enrichRecordings(client *dispatcharr.Client, recordings []json.RawMessage) []json.RawMessage {
+	enriched := make([]json.RawMessage, 0, len(recordings))
+	for _, recording := range recordings {
+		enriched = append(enriched, enrichRecording(client, recording))
+	}
+	return enriched
+}
+
+func enrichRecording(client *dispatcharr.Client, recording json.RawMessage) json.RawMessage {
+	var object map[string]any
+	if err := json.Unmarshal(recording, &object); err != nil {
+		return recording
+	}
+	id := fmt.Sprint(object["id"])
+	playbackURL := recordingPlaybackURL(client, id, object)
+	object["_silo"] = map[string]any{
+		"playback_url":   playbackURL,
+		"playback_owner": "dispatcharr",
+	}
+	out, err := json.Marshal(object)
+	if err != nil {
+		return recording
+	}
+	return out
+}
+
+func recordingPlaybackURL(client *dispatcharr.Client, id string, object map[string]any) string {
+	custom, _ := object["custom_properties"].(map[string]any)
+	if raw, ok := custom["output_file_url"].(string); ok && strings.TrimSpace(raw) != "" {
+		return client.AbsoluteURL(raw)
+	}
+	if raw, ok := custom["file_url"].(string); ok && strings.TrimSpace(raw) != "" {
+		return client.AbsoluteURL(raw)
+	}
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(id) == "<nil>" {
+		return ""
+	}
+	return client.AbsoluteURL("/api/channels/recordings/" + strings.TrimSpace(id) + "/file/")
+}
+
+func xtreamConnectionSettings(settings config.Settings) (string, string, string) {
+	if settings.SourceMode == config.SourceModeDirectLogin {
+		return settings.DispatcharrURL, settings.DispatcharrUser, settings.DispatcharrPass
+	}
+	return settings.XtreamBaseURL, settings.XtreamUsername, settings.XtreamPassword
+}
+
+// decodeGuideProgramText decodes the base64 title/summary some Xtream panels
+// return from get_short_epg. Cached snapshots may still hold encoded text, so
+// the guide index applies this once per snapshot.
+func decodeGuideProgramText(program model.Program) model.Program {
+	if strings.HasPrefix(program.ChannelID, "xtream:") {
+		program.Title = xtream.DecodeEPGText(program.Title)
+		program.Summary = xtream.DecodeEPGText(program.Summary)
+	}
+	return program
+}
+
+func normalizeChannelIDs(ids []string) []string {
+	seen := map[string]bool{}
+	normalized := make([]string, 0, len(ids))
+	for _, id := range ids {
+		value := strings.TrimSpace(id)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func currentProgramCountForChannels(programs []model.Program, channelIDs []string, nowUnix int64) int {
+	if len(channelIDs) == 0 {
+		return 0
+	}
+	channelSet := make(map[string]bool, len(channelIDs))
+	for _, id := range channelIDs {
+		channelSet[id] = true
+	}
+	channelsWithPrograms := map[string]bool{}
+	for _, program := range programs {
+		if !channelSet[program.ChannelID] {
+			continue
+		}
+		start := program.StartUnix
+		end := program.EndUnix
+		if end == 0 {
+			end = start + 1800
+		}
+		if start <= nowUnix+1800 && end >= nowUnix-300 {
+			channelsWithPrograms[program.ChannelID] = true
+		}
+	}
+	return len(channelsWithPrograms)
+}
+
+func liveCategories(snapshot cache.Snapshot) []model.Category {
+	if len(snapshot.Catalog.Content.LiveCategories) > 0 {
+		return snapshot.Catalog.Content.LiveCategories
+	}
+	seen := map[string]bool{}
+	categories := make([]model.Category, 0)
+	for _, channel := range snapshot.Catalog.Channels {
+		if channel.CategoryID == "" || seen[channel.CategoryID] {
+			continue
+		}
+		seen[channel.CategoryID] = true
+		name := channel.CategoryName
+		if name == "" {
+			name = "Group " + channel.CategoryID
+		}
+		categories = append(categories, model.Category{ID: channel.CategoryID, Name: name, Kind: "live"})
+	}
+	sort.Slice(categories, func(i, j int) bool {
+		return categories[i].Name < categories[j].Name
+	})
+	return categories
+}
+
+func appCapabilities(sourceMode model.SourceMode) AppCapabilities {
+	fullCatalog := sourceMode != model.SourceModeM3UXMLTV
+	return AppCapabilities{
+		LiveTV:                true,
+		Guide:                 true,
+		VOD:                   fullCatalog,
+		Series:                fullCatalog,
+		Recordings:            false,
+		Favorites:             true,
+		HiddenCategories:      true,
+		BackendProxySupported: false,
+		StreamMode:            "redirect",
+		NativeLiveTVExport:    false,
+	}
+}
+
+func dvrEnabledForSource(sourceMode model.SourceMode) bool {
+	return sourceMode == model.SourceModeDirectLogin || sourceMode == model.SourceModeAPIKey
+}
+
+func queryValue(request *pluginv1.HandleHTTPRequest, key string) string {
+	query := request.GetQuery()
+	if query == nil {
+		return ""
+	}
+	value := query.AsMap()[key]
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return ""
+}
+
+func appendPlaybackQuery(streamURL string, request *pluginv1.HandleHTTPRequest) string {
+	parsed, err := url.Parse(streamURL)
+	if err != nil {
+		return streamURL
+	}
+	values := parsed.Query()
+	for _, key := range []string{"output_profile", "output_format", "output"} {
+		value := strings.TrimSpace(queryValue(request, key))
+		if value != "" {
+			values.Set(key, value)
+		}
+	}
+	parsed.RawQuery = values.Encode()
+	return parsed.String()
+}
+
+func redirectResponse(location string) *pluginv1.HandleHTTPResponse {
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: http.StatusFound,
+		Headers: map[string]string{
+			"location": location,
+		},
+	}
+}
+
+func htmlResponse(status int, body string) *pluginv1.HandleHTTPResponse {
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: int32(status),
+		Headers: map[string]string{
+			"cache-control": "no-store",
+			"content-type":  "text/html; charset=utf-8",
+		},
+		Body: []byte(body),
+	}
+}
+
+func textResponse(status int, message string) *pluginv1.HandleHTTPResponse {
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: int32(status),
+		Headers: map[string]string{
+			"content-type": "text/plain; charset=utf-8",
+		},
+		Body: []byte(message),
+	}
+}
