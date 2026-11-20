@@ -1,21 +1,16 @@
 package plugin
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"math"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/cache"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/model"
-	"github.com/attmonk/silo-plugins/pkg/epg"
 )
 
 // guideIndex is a read-only view of one snapshot's guide, built once per
@@ -29,10 +24,6 @@ type guideIndex struct {
 	// before a window start an overlapping program can begin.
 	allMaxDuration int64
 	byChannel      map[string]channelGuide
-	// lineup is the snapshot's channel list and lineupPosition maps a channel
-	// ID to its first index in it, so lineup ordering never searches.
-	lineup         []model.Channel
-	lineupPosition map[string]int
 }
 
 type channelGuide struct {
@@ -72,14 +63,6 @@ func buildGuideIndex(snapshot cache.Snapshot) *guideIndex {
 		version:   snapshot.Version,
 		all:       programs,
 		byChannel: map[string]channelGuide{},
-
-		lineup:         snapshot.Catalog.Channels,
-		lineupPosition: make(map[string]int, len(snapshot.Catalog.Channels)),
-	}
-	for position, channel := range snapshot.Catalog.Channels {
-		if _, exists := index.lineupPosition[channel.ID]; !exists {
-			index.lineupPosition[channel.ID] = position
-		}
 	}
 	for _, program := range programs {
 		duration := programDuration(program)
@@ -244,44 +227,3 @@ func parseGuideQuery(request *pluginv1.HandleHTTPRequest) (guideQuery, error) {
 }
 
 const maxGuideQueryChannels = 2000
-
-// windowGuideIndex only materializes the requested SQLite window. In-memory
-// imports/tests keep their existing index; published schedules stay on disk.
-func (c *guideIndexCache) window(ctx context.Context, snapshot cache.Snapshot, ids []string, window guideWindow) (*guideIndex, error) {
-	if snapshot.Guide == nil {
-		return c.get(snapshot), nil
-	}
-	// Drop a legacy index once persistence takes ownership of the guide.
-	c.mu.Lock()
-	c.index = nil
-	c.mu.Unlock()
-	programs, err := snapshot.ProgramQuery(ctx, ids, window.Start, window.End)
-	if err != nil {
-		return nil, err
-	}
-	snapshot.Catalog.Programs = programs
-	snapshot.Guide = nil
-	return buildGuideIndex(snapshot), nil
-}
-func (s *HTTPRoutesServer) windowGuideIndex(ctx context.Context, ids []string, window guideWindow) (*guideIndex, error) {
-	ctx, cancel := context.WithTimeout(ctx, 7*time.Second)
-	defer cancel()
-	for attempt := 0; attempt < 2; attempt++ {
-		snapshot := s.store.Current()
-		index, err := s.guideIndex.window(ctx, snapshot, ids, window)
-		if errors.Is(err, epg.ErrChanged) {
-			runtime.Gosched()
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		index, err = s.withSportsGuide(ctx, snapshot, index, ids, window)
-		if errors.Is(err, epg.ErrChanged) {
-			runtime.Gosched()
-			continue
-		}
-		return index, err
-	}
-	return nil, epg.ErrChanged
-}

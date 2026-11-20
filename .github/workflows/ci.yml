@@ -25,13 +25,6 @@ jobs:
           node-version: 22
       - name: Verify plugin
         run: ./scripts/verify-release.sh
-      - name: Test game companion in Chromium
-        run: |
-          npm install --prefix "${RUNNER_TEMP}/sports-companion" --no-save playwright@1.65.0
-          node "${RUNNER_TEMP}/sports-companion/node_modules/playwright/cli.js" install chromium
-          PLAYWRIGHT_PATH="${RUNNER_TEMP}/sports-companion/node_modules/playwright" node scripts/sports-companion-browser.cjs
-          PLAYWRIGHT_PATH="${RUNNER_TEMP}/sports-companion/node_modules/playwright" node scripts/player-layout-browser.cjs
-
       - name: Verify tagged version
         if: startsWith(github.ref, 'refs/tags/v')
         run: ./scripts/verify-release.sh "${GITHUB_REF_NAME#v}" --version-only
@@ -87,15 +80,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Get an attmonk-ci token
-        id: app
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: 5324952
-          private-key: ${{ secrets.ATTMONK_CI_APPKEY || secrets.ATTMONK_CI_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-
       - uses: actions/download-artifact@v4
         with:
           path: release-dist
@@ -109,18 +93,6 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          token: ${{ steps.app.outputs.token }}
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           files: release-dist/*
-
-  catalog:
-    needs: release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    uses: attmonk/silo-plugins/.github/workflows/publish-plugin.yml@main
-    with:
-      plugin-id: silo.attmonk.xtream
-      display-name: XC for Silo
-      asset-prefix: xtream-{version}-
-      replace-old: false
-    secrets: inherit

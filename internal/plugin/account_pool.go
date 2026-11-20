@@ -1,7 +1,6 @@
 package plugin
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,9 +10,6 @@ import (
 
 const accountLeaseTTL = 90 * time.Second
 
-// errAccountPoolFull means every playback account is at its connection limit.
-var errAccountPoolFull = errors.New("all playback accounts are at their connection limit")
-
 type accountLease struct {
 	sourceID  string
 	accountID string
@@ -21,10 +17,9 @@ type accountLease struct {
 }
 
 type accountPool struct {
-	mu       sync.Mutex
-	now      func() time.Time
-	leases   map[string]accountLease
-	cooldown map[string]time.Time
+	mu     sync.Mutex
+	now    func() time.Time
+	leases map[string]accountLease
 }
 
 func newAccountPool(now func() time.Time) *accountPool {
@@ -60,9 +55,6 @@ func (p *accountPool) Lease(sessionID string, source config.XtreamSource) (confi
 	}
 	selected := -1
 	for index, account := range accounts {
-		if now.Before(p.cooldown[source.ID+"/"+account.ID]) {
-			continue
-		}
 		if account.ConnectionLimit > 0 && usage[account.ID] >= account.ConnectionLimit {
 			continue
 		}
@@ -71,25 +63,20 @@ func (p *accountPool) Lease(sessionID string, source config.XtreamSource) (confi
 		}
 	}
 	if selected < 0 {
-		return config.XtreamAccount{}, fmt.Errorf("provider %q: %w", source.Name, errAccountPoolFull)
+		return config.XtreamAccount{}, fmt.Errorf("all playback accounts for %q are at their connection limit", source.Name)
 	}
 	account := accounts[selected]
 	p.leases[sessionID] = accountLease{sourceID: source.ID, accountID: account.ID, seenAt: now}
 	return account, nil
 }
 
-// Touch renews a lease and reports whether the session still holds one.
-func (p *accountPool) Touch(sessionID string) bool {
+func (p *accountPool) Touch(sessionID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := p.now()
-	p.prune(now)
-	lease, ok := p.leases[sessionID]
-	if ok {
-		lease.seenAt = now
+	if lease, ok := p.leases[sessionID]; ok {
+		lease.seenAt = p.now()
 		p.leases[sessionID] = lease
 	}
-	return ok
 }
 
 func (p *accountPool) Release(sessionID string) {
@@ -112,26 +99,9 @@ func (p *accountPool) Usage(sourceID string) map[string]int {
 }
 
 func (p *accountPool) prune(now time.Time) {
-	for id, until := range p.cooldown {
-		if !now.Before(until) {
-			delete(p.cooldown, id)
-		}
-	}
 	for sessionID, lease := range p.leases {
 		if now.Sub(lease.seenAt) > accountLeaseTTL {
 			delete(p.leases, sessionID)
 		}
-	}
-}
-
-func (p *accountPool) Reject(session string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if lease, ok := p.leases[session]; ok {
-		if p.cooldown == nil {
-			p.cooldown = map[string]time.Time{}
-		}
-		p.cooldown[lease.sourceID+"/"+lease.accountID] = p.now().Add(15 * time.Second)
-		delete(p.leases, session)
 	}
 }

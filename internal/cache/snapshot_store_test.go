@@ -1,8 +1,6 @@
 package cache
 
 import (
-	"context"
-	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,7 +24,7 @@ func TestFileSnapshotStorageRoundTripsCatalogSnapshot(t *testing.T) {
 		Health: model.SyncHealth{LastSuccessUnix: 100},
 	}
 
-	if _, err := storage.Save(snapshot); err != nil {
+	if err := storage.Save(snapshot); err != nil {
 		t.Fatalf("save snapshot: %v", err)
 	}
 	loaded, ok, err := storage.Load()
@@ -42,11 +40,10 @@ func TestFileSnapshotStorageRoundTripsCatalogSnapshot(t *testing.T) {
 	if len(loaded.Catalog.Channels) != 1 || loaded.Catalog.Channels[0].ID != "channel:1" {
 		t.Fatalf("unexpected loaded channels: %+v", loaded.Catalog.Channels)
 	}
-	programs, err := loaded.ProgramQuery(context.Background(), nil, math.MinInt64, math.MaxInt64)
-	if err != nil || len(programs) != 1 || programs[0].ID != "program:1" {
+	if len(loaded.Catalog.Programs) != 1 || loaded.Catalog.Programs[0].ID != "program:1" {
 		t.Fatalf("unexpected loaded programs: %+v", loaded.Catalog.Programs)
 	}
-	info, err := os.Stat(storage.Path())
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat snapshot: %v", err)
 	}
@@ -60,7 +57,7 @@ func TestFileSnapshotStorageSkipsEmptySnapshots(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "catalog-snapshot.json")
 	storage := NewFileSnapshotStorage(path)
-	if _, err := storage.Save(Snapshot{}); err != nil {
+	if err := storage.Save(Snapshot{}); err != nil {
 		t.Fatalf("save empty snapshot: %v", err)
 	}
 	_, ok, err := storage.Load()

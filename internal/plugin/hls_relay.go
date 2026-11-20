@@ -19,7 +19,7 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/config"
-	upstreamhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
+	upstreamhttp "github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/httpclient"
 )
 
 const (
@@ -360,8 +360,7 @@ func relayConfiguredHosts(settings config.Settings) []string {
 }
 
 func (s *HTTPRoutesServer) relayConfiguredHosts() []string {
-	// A user's own providers get no exemption from the public-address check.
-	if s.settingsProvider == nil || s.tenantUserID != "" {
+	if s.settingsProvider == nil {
 		return nil
 	}
 	return relayConfiguredHosts(s.settingsProvider())

@@ -5,18 +5,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/model"
-	"github.com/attmonk/silo-plugins/pkg/epg"
-	"github.com/attmonk/silo-plugins/pkg/sportsguide"
 )
 
 type Snapshot struct {
-	Guide                  *epg.View[model.Program] `json:"-"`
 	Catalog                model.CatalogState
 	Health                 model.SyncHealth
 	PlaybackResolvedAtUnix int64
@@ -28,14 +23,6 @@ type Snapshot struct {
 }
 
 type Store struct {
-	storagePath   atomic.Value
-	overlayMu     sync.Mutex
-	overlay       *sportsguide.Store
-	overlayPath   string
-	current       atomic.Value // Immutable published Snapshot; imports never block readers.
-	watchMu       sync.Mutex
-	adminMu       sync.RWMutex
-	storage       SnapshotStorage
 	mu            sync.RWMutex
 	snapshot      Snapshot
 	version       uint64
@@ -65,33 +52,31 @@ func NewStore() *Store {
 }
 
 func (s *Store) Current() Snapshot {
-	if snapshot := s.current.Load(); snapshot != nil {
-		return snapshot.(Snapshot)
-	}
-	return Snapshot{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.snapshot
 }
 
-func (s *Store) Replace(snapshot Snapshot) error { return s.replace(snapshot, true) }
+func (s *Store) Replace(snapshot Snapshot) {
+	s.replace(snapshot, true)
+}
 
-func (s *Store) ReplaceExact(snapshot Snapshot) error { return s.replace(snapshot, false) }
+func (s *Store) ReplaceExact(snapshot Snapshot) {
+	s.replace(snapshot, false)
+}
 
-func (s *Store) replace(snapshot Snapshot, preserveGuide bool) error {
+func (s *Store) replace(snapshot Snapshot, preserveGuide bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	regressionWarning := ""
-	if !preserveGuide && snapshot.Guide == nil && snapshot.ProgramCount() > 0 && sameGuideScope(s.snapshot, snapshot) && s.snapshot.coversChannels(snapshot.Catalog.Channels) {
-		var err error
-		regressionWarning, err = snapshotRegressionWarning(s.snapshot, snapshot.Catalog.Programs, snapshot.Health.LastSuccessUnix)
-		if err != nil {
-			return err
-		}
+	if !preserveGuide && len(snapshot.Catalog.Programs) > 0 && sameGuideScope(s.snapshot, snapshot) && haveProgramChannels(snapshot.Catalog.Channels, s.snapshot.Catalog.Programs) {
+		regressionWarning = guideRegressionWarning(s.snapshot.Catalog.Programs, snapshot.Catalog.Programs, snapshot.Health.LastSuccessUnix)
 	}
 	if regressionWarning != "" || (preserveGuide && shouldPreserveGuide(s.snapshot, snapshot)) {
-		snapshot.Catalog.Programs = s.snapshot.Catalog.Programs
-		snapshot.Guide = s.snapshot.Guide
+		snapshot.Catalog.Programs = append([]model.Program(nil), s.snapshot.Catalog.Programs...)
 		snapshot.Catalog.Health.EPGStatus = preservedEPGStatus(s.snapshot)
-		snapshot.Catalog.Health.EPGProgramCount = s.snapshot.ProgramCount()
+		snapshot.Catalog.Health.EPGProgramCount = len(s.snapshot.Catalog.Programs)
 		snapshot.Catalog.Health.EPGLastSuccessUnix = s.snapshot.Health.EPGLastSuccessUnix
 		snapshot.Catalog.Health.EPGLastFailureUnix = s.snapshot.Health.EPGLastFailureUnix
 		snapshot.Catalog.Health.EPGLastError = s.snapshot.Health.EPGLastError
@@ -108,12 +93,12 @@ func (s *Store) replace(snapshot Snapshot, preserveGuide bool) error {
 	}
 	snapshot.Health.LastFailureUnix = 0
 	snapshot.Health.LastError = ""
-	if snapshot.Health.EPGStatus == "" && snapshot.Health.LastSuccessUnix != 0 && snapshot.ProgramCount() > 0 {
+	if snapshot.Health.EPGStatus == "" && snapshot.Health.LastSuccessUnix != 0 && len(snapshot.Catalog.Programs) > 0 {
 		snapshot.Catalog.Health.EPGStatus = "ok"
-		snapshot.Catalog.Health.EPGProgramCount = snapshot.ProgramCount()
+		snapshot.Catalog.Health.EPGProgramCount = len(snapshot.Catalog.Programs)
 		snapshot.Catalog.Health.EPGLastSuccessUnix = snapshot.Health.LastSuccessUnix
 		snapshot.Health.EPGStatus = "ok"
-		snapshot.Health.EPGProgramCount = snapshot.ProgramCount()
+		snapshot.Health.EPGProgramCount = len(snapshot.Catalog.Programs)
 		snapshot.Health.EPGLastSuccessUnix = snapshot.Health.LastSuccessUnix
 	}
 	if snapshot.Health.EPGStatus == "" {
@@ -124,25 +109,15 @@ func (s *Store) replace(snapshot Snapshot, preserveGuide bool) error {
 		snapshot.Health.EPGLastError = s.snapshot.Health.EPGLastError
 		snapshot.Health.EPGWarning = s.snapshot.Health.EPGWarning
 	}
-	if s.storage != nil {
-		var err error
-		snapshot, err = s.storage.Save(snapshot)
-		if err != nil {
-			return fmt.Errorf("persist catalog snapshot: %w", err)
-		}
-	}
 	s.version++
 	snapshot.Version = s.version
 	s.snapshot = snapshot
-	s.current.Store(snapshot)
-	return nil
 }
 
 // touchLocked marks an in-place snapshot mutation. Callers hold s.mu.
 func (s *Store) touchLocked() {
 	s.version++
 	s.snapshot.Version = s.version
-	s.current.Store(s.snapshot)
 }
 
 // shouldPreserveGuide decides whether a non-exact sync keeps the current
@@ -152,13 +127,13 @@ func shouldPreserveGuide(current, next Snapshot) bool {
 	if !sameGuideScope(current, next) {
 		return false
 	}
-	if current.ProgramCount() == 0 {
+	if len(current.Catalog.Programs) == 0 {
 		return false
 	}
-	if next.ProgramCount() >= current.ProgramCount() {
+	if len(next.Catalog.Programs) >= len(current.Catalog.Programs) {
 		return false
 	}
-	return current.coversChannels(next.Catalog.Channels)
+	return haveProgramChannels(next.Catalog.Channels, current.Catalog.Programs)
 }
 
 // sameGuideScope reports whether two snapshots describe the same source
@@ -211,7 +186,7 @@ func preservedEPGStatus(current Snapshot) string {
 		status = current.Health.EPGStatus
 	}
 	if status == "" || status == "loading" {
-		if current.ProgramCount() > 0 {
+		if len(current.Catalog.Programs) > 0 {
 			return "ok"
 		}
 	}
@@ -242,8 +217,8 @@ func haveProgramChannels(channels []model.Channel, programs []model.Program) boo
 }
 
 func (s *Store) AdminSettings() json.RawMessage {
-	s.adminMu.RLock()
-	defer s.adminMu.RUnlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if len(s.adminSettings) == 0 {
 		return json.RawMessage(`{}`)
@@ -252,23 +227,23 @@ func (s *Store) AdminSettings() json.RawMessage {
 }
 
 func (s *Store) HasAdminSettings() bool {
-	s.adminMu.RLock()
-	defer s.adminMu.RUnlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	return len(s.adminSettings) > 0
 }
 
 func (s *Store) SetAdminSettings(settings json.RawMessage) json.RawMessage {
-	s.adminMu.Lock()
-	defer s.adminMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.adminSettings = append(json.RawMessage(nil), settings...)
 	return append(json.RawMessage(nil), s.adminSettings...)
 }
 
 func (s *Store) StartWatch(kind, id, name string) WatchSession {
-	s.watchMu.Lock()
-	defer s.watchMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.ensureSessions()
 	now := time.Now().Unix()
@@ -287,8 +262,8 @@ func (s *Store) StartWatch(kind, id, name string) WatchSession {
 }
 
 func (s *Store) HeartbeatWatch(id string) (WatchSession, bool) {
-	s.watchMu.Lock()
-	defer s.watchMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.ensureSessions()
 	session, ok := s.sessions[id]
@@ -301,8 +276,8 @@ func (s *Store) HeartbeatWatch(id string) (WatchSession, bool) {
 }
 
 func (s *Store) StopWatch(id, reason string) (WatchSession, bool) {
-	s.watchMu.Lock()
-	defer s.watchMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.ensureSessions()
 	session, ok := s.sessions[id]
@@ -347,7 +322,6 @@ func (s *Store) ClearGuidePrograms(atUnix int64) {
 	defer s.touchLocked()
 
 	s.snapshot.Catalog.Programs = nil
-	s.snapshot.Guide = nil
 	s.snapshot.Catalog.Health.EPGStatus = "loading"
 	s.snapshot.Catalog.Health.EPGProgramCount = 0
 	s.snapshot.Catalog.Health.EPGLastSuccessUnix = 0
@@ -365,42 +339,22 @@ func (s *Store) ClearGuidePrograms(atUnix int64) {
 // half of the current guide's programs or channel coverage, the current guide
 // is kept and a warning is recorded instead; it reports whether the new
 // programs were applied.
-func (s *Store) ReplacePrograms(programs []model.Program, atUnix int64) (bool, error) {
+func (s *Store) ReplacePrograms(programs []model.Program, atUnix int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	previous := s.snapshot
-	applied := false
-	defer func() {
-		if !applied {
-			s.snapshot = previous
-		}
-	}()
+	defer s.touchLocked()
 
-	warning, err := snapshotRegressionWarning(s.snapshot, programs, atUnix)
-	if err != nil {
-		return false, fmt.Errorf("persist catalog snapshot: %w", err)
-	}
-	if warning != "" {
+	if warning := guideRegressionWarning(s.snapshot.Catalog.Programs, programs, atUnix); warning != "" {
 		status := preservedEPGStatus(s.snapshot)
 		s.snapshot.Catalog.Health.EPGStatus = status
 		s.snapshot.Catalog.Health.EPGWarning = warning
 		s.snapshot.Health.EPGStatus = status
-		s.snapshot.Health.EPGProgramCount = s.snapshot.ProgramCount()
+		s.snapshot.Health.EPGProgramCount = len(s.snapshot.Catalog.Programs)
 		s.snapshot.Health.EPGWarning = warning
-		if s.storage != nil {
-			var err error
-			s.snapshot, err = s.storage.Save(s.snapshot)
-			if err != nil {
-				return false, fmt.Errorf("persist catalog snapshot: %w", err)
-			}
-		}
-		s.touchLocked()
-		applied = true
-		return false, nil
+		return false
 	}
 
 	s.snapshot.Catalog.Programs = append([]model.Program(nil), programs...)
-	s.snapshot.Guide = nil
 	s.snapshot.Catalog.Health.EPGStatus = "ok"
 	s.snapshot.Catalog.Health.EPGProgramCount = len(programs)
 	s.snapshot.Catalog.Health.EPGLastSuccessUnix = atUnix
@@ -411,16 +365,7 @@ func (s *Store) ReplacePrograms(programs []model.Program, atUnix int64) (bool, e
 	s.snapshot.Health.EPGLastError = ""
 	s.snapshot.Catalog.Health.EPGWarning = ""
 	s.snapshot.Health.EPGWarning = ""
-	if s.storage != nil {
-		var err error
-		s.snapshot, err = s.storage.Save(s.snapshot)
-		if err != nil {
-			return false, fmt.Errorf("persist catalog snapshot: %w", err)
-		}
-	}
-	s.touchLocked()
-	applied = true
-	return true, nil
+	return true
 }
 
 func (s *Store) RecordEPGFailure(atUnix int64, message string) {
@@ -474,64 +419,4 @@ func newSessionID() string {
 		return hex.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))
 	}
 	return hex.EncodeToString(buf[:])
-}
-
-func (s *Store) SetStorage(storage SnapshotStorage) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.storage = storage
-	path := ""
-	if storage != nil {
-		path = storage.Path()
-	}
-	s.storagePath.Store(path)
-}
-func (s *Store) Persist() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.storage == nil {
-		return nil
-	}
-	snapshot, err := s.storage.Save(s.snapshot)
-	if err != nil {
-		return err
-	}
-	changed := snapshot.Guide != s.snapshot.Guide
-	s.snapshot = snapshot
-	if changed {
-		s.touchLocked()
-	} else {
-		s.current.Store(snapshot)
-	}
-	return nil
-}
-
-// GuideOverlay belongs to the same installation/account as the catalog.
-func (s *Store) GuideOverlay() (*sportsguide.Store, error) {
-	s.overlayMu.Lock()
-	defer s.overlayMu.Unlock()
-	path := ""
-	if value := s.storagePath.Load(); value != nil && value.(string) != "" {
-		path = filepath.Join(filepath.Dir(value.(string)), "sports-guide.sqlite")
-	}
-	if s.overlay != nil && s.overlayPath == path {
-		return s.overlay, nil
-	}
-	overlay, err := sportsguide.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	if s.overlay != nil {
-		_ = s.overlay.Close()
-	}
-	s.overlay, s.overlayPath = overlay, path
-	return overlay, nil
-}
-func (s *Store) Close() error {
-	s.overlayMu.Lock()
-	defer s.overlayMu.Unlock()
-	if s.overlay != nil {
-		return s.overlay.Close()
-	}
-	return nil
 }

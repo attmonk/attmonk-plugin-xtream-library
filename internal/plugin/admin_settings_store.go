@@ -4,13 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	mediaweb "github.com/attmonk/silo-plugins/pkg/livemedia/web"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-
-	"github.com/attmonk/silo-plugins/pkg/sportsguide"
 )
 
 const DefaultAdminSettingsFile = "/var/lib/continuum/plugins/silo.attmonk.xtream/category-settings.json"
@@ -186,8 +183,6 @@ func normalizeAdminSettingsPayload(payload map[string]any) map[string]any {
 	}
 
 	return map[string]any{
-		userSourcesEnabledKey:            payload[userSourcesEnabledKey] == true,
-		"sportsGuide":                    sportsguide.DecodePolicy(payload["sportsGuide"]),
 		"sportsEnabled":                  payload["sportsEnabled"] == true,
 		"mode":                           mode,
 		"delimiter":                      delimiter,
@@ -206,7 +201,6 @@ func normalizeAdminSettingsPayload(payload map[string]any) map[string]any {
 		"collapseDuplicateVirtualGroups": collapseDuplicateVirtualGroups,
 		"inferChannelNameGroups":         inferChannelNameGroups,
 		"categoryRenames":                categoryRenames,
-		"stationMappings":                mediaweb.NormalizeStations(payload["stationMappings"]),
 		"categoryAliases":                categoryAliases,
 		"eventKeywords":                  eventKeywords,
 	}

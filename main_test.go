@@ -295,12 +295,6 @@ func TestManifestExposesOnlyXtreamPublicRoutes(t *testing.T) {
 		"/xtream/assets/app.js",
 		"/xtream/assets/xc-runtime-a.js",
 		"/xtream/assets/xc-runtime-b.js",
-		// The livetv/v1 contract paths have no /dispatcharr prefix, so the
-		// rewrite must leave them exactly as Silo's Jellyfin bridge calls them.
-		"/silo-compat/livetv/v1/info",
-		"/silo-compat/livetv/v1/channels",
-		"/silo-compat/livetv/v1/programs",
-		"/silo-compat/livetv/v1/stream",
 	} {
 		found := false
 		for _, route := range manifest.GetHttpRoutes() {
@@ -457,13 +451,6 @@ func TestManifestUserPreferenceSchemaAcceptsBrowserPayload(t *testing.T) {
 		"customGroups":        []any{map[string]any{"id": "group:news", "name": "News", "order": float64(1)}},
 		"customGroupMemberships": map[string]any{
 			"group:news": []any{"channel:1"},
-		},
-		"profiles": map[string]any{
-			"p2": map[string]any{
-				"favorites":        map[string]any{"channel:2": true},
-				"favoriteOrder":    []any{"channel:2"},
-				"hiddenCategories": map[string]any{"7": true},
-			},
 		},
 	}
 	delete(preferences, "autoFavorites")

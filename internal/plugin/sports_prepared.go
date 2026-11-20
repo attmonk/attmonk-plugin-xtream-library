@@ -2,13 +2,9 @@ package plugin
 
 import (
 	"context"
-	"log"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/attmonk/attmonk-plugin-xtream-library/internal/cache"
-	"github.com/attmonk/silo-plugins/pkg/sportsguide"
 )
 
 func (s *HTTPRoutesServer) sportsPayload(ctx context.Context, refresh bool) SportsPayload {
@@ -19,21 +15,10 @@ func (s *HTTPRoutesServer) sportsPayloadWithBudget(ctx context.Context, refresh 
 	budget = budget.withDefaults()
 	now := time.Now()
 	snapshot := s.store.Current()
-	guide := s.sportsGuide.get(snapshot, now)
-	return s.buildSportsPayload(ctx, refresh, budget, snapshot, now, guide)
-}
-
-// buildSportsPayload reuses the guide extraction already prepared by the
-// background rebuild, instead of parsing it again for the provider merge.
-func (s *HTTPRoutesServer) buildSportsPayload(ctx context.Context, refresh bool, budget sportsBuildBudget, snapshot cache.Snapshot, now time.Time, guide sportsGuideData) SportsPayload {
-	if guide.Unavailable {
-		return SportsPayload{Source: "Guide cache", UpdatedAtUnix: now.Unix(), Events: []SportsEvent{}, Leagues: []SportsLeague{}, FavoriteTeams: []string{}, Incomplete: true, Error: "Guide cache is temporarily unavailable. Retrying."}
-	}
-	guideEvents := guide.Events
+	guideEvents, refreshScores := sportsEventsFromGuideWithScoreHints(snapshot, now)
 	providerCtx, cancelProvider := context.WithTimeout(ctx, budget.Provider)
-	events, updatedUnix, source, err := s.cachedSportsEvents(providerCtx, now, refresh || guide.RefreshScores)
+	events, updatedUnix, source, err := s.cachedSportsEvents(providerCtx, now, refresh || refreshScores)
 	cancelProvider()
-	schedule := independentGuideSchedule(events, source, err)
 	if len(guideEvents) > 0 {
 		if len(events) == 0 {
 			events = guideEvents
@@ -53,7 +38,7 @@ func (s *HTTPRoutesServer) buildSportsPayload(ctx context.Context, refresh bool,
 	// The match deadline starts after the provider fetch, independent of it.
 	matchCtx, cancelMatch := context.WithTimeout(ctx, budget.Match)
 	defer cancelMatch()
-	channelIndex := guide.Channels
+	channelIndex := newSportsChannelIndex(snapshot)
 	incomplete := false
 	for index := range events {
 		events[index] = normalizeSportsEventFreshness(events[index], now)
@@ -103,7 +88,6 @@ func (s *HTTPRoutesServer) buildSportsPayload(ctx context.Context, refresh bool,
 	events = rankSportsEvents(events, now)
 	events = s.proxySportsEventImages(events)
 	payload := SportsPayload{
-		guideSchedule: schedule,
 		UpdatedAtUnix: updatedUnix,
 		Source:        source,
 		Leagues:       sportsLeagues(events),
@@ -121,10 +105,7 @@ func normalizeSportsEventFreshness(event SportsEvent, now time.Time) SportsEvent
 	if !event.Live {
 		return event
 	}
-	stale := event.StartUnix <= 0 && event.EndUnix <= 0
-	if !stale && event.EndUnix > 0 && event.EndUnix < now.Add(-2*time.Hour).Unix() {
-		stale = true
-	}
+	stale := event.EndUnix > 0 && event.EndUnix < now.Add(-2*time.Hour).Unix()
 	if !stale && event.StartUnix > 0 && event.StartUnix < now.Add(-18*time.Hour).Unix() {
 		stale = true
 	}
@@ -181,6 +162,17 @@ func (s *HTTPRoutesServer) preparedSportsPayload(refresh bool) SportsPayload {
 		}
 		payload.Source = provider.Source()
 	}
+	if !s.sportsPrepared.Ready && len(payload.Events) == 0 {
+		if guideEvents := sportsEventsFromGuide(snapshot, now); len(guideEvents) > 0 {
+			payload.Events = guideEvents
+			payload.Leagues = sportsLeagues(guideEvents)
+			payload.Source = "EPG fallback"
+			payload.UpdatedAtUnix = snapshot.Health.EPGLastSuccessUnix
+			if payload.UpdatedAtUnix <= 0 {
+				payload.UpdatedAtUnix = now.Unix()
+			}
+		}
+	}
 	s.sportsPreparedMu.Unlock()
 	return payload
 }
@@ -189,9 +181,7 @@ func (s *HTTPRoutesServer) preparedSportsPayload(refresh bool) SportsPayload {
 // payload is missing, stale or behind the guide. sportsPreparedMu must be held.
 func (s *HTTPRoutesServer) scheduleSportsRebuildLocked(now time.Time, guideUpdatedUnix int64, refresh bool) {
 	guideChanged := guideUpdatedUnix > 0 && guideUpdatedUnix != s.sportsPrepared.GuideUpdatedUnix
-	policyKey := sportsguide.Fingerprint(s.sportsGuidePolicy())
-	policyChanged := s.sportsPrepared.GuidePolicyKey != "" && s.sportsPrepared.GuidePolicyKey != policyKey
-	needsRefresh := !s.sportsPrepared.Ready || refresh || guideChanged || policyChanged || now.After(s.sportsPrepared.ExpiresAfter)
+	needsRefresh := !s.sportsPrepared.Ready || refresh || guideChanged || now.After(s.sportsPrepared.ExpiresAfter)
 	if needsRefresh && !s.sportsPrepared.Refreshing {
 		s.sportsPrepared.Refreshing = true
 		go s.rebuildSportsPayload(refresh)
@@ -220,7 +210,7 @@ func (s *HTTPRoutesServer) preparedSportsEvent(id string) (SportsEvent, bool) {
 		return SportsEvent{}, false
 	}
 	s.sportsPreparedMu.Unlock()
-	// The background build may have published a guide fallback already.
+	// Before the first build the guide fallback is assembled per request.
 	for _, event := range s.preparedSportsPayload(false).Events {
 		if event.ID == id || event.StableID == id {
 			return event, true
@@ -230,41 +220,17 @@ func (s *HTTPRoutesServer) preparedSportsEvent(id string) (SportsEvent, bool) {
 }
 
 func (s *HTTPRoutesServer) rebuildSportsPayload(refresh bool) {
-	policyKey := sportsguide.Fingerprint(s.sportsGuidePolicy())
-	snapshot := s.store.Current()
-	guideUpdatedUnix := snapshot.Health.EPGLastSuccessUnix
+	guideUpdatedUnix := s.store.Current().Health.EPGLastSuccessUnix
 	s.sportsPreparedMu.Lock()
 	budget := s.sportsPrepared.budget.withDefaults()
 	s.sportsPreparedMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), budget.Provider+budget.Match+budget.Enrich+6*time.Second)
-	startedAt := time.Now()
-	guide := s.sportsGuide.get(snapshot, startedAt)
-	guideEvents := guide.Events
-	// Publish the first guide fallback before waiting for Sportarr. This work
-	// happens once per rebuild and never holds up an HTTP request or the lock.
-	if len(guideEvents) > 0 {
-		updated := guideUpdatedUnix
-		if updated <= 0 {
-			updated = startedAt.Unix()
-		}
-		s.sportsPreparedMu.Lock()
-		if !s.sportsPrepared.Ready {
-			s.sportsPrepared.Payload = SportsPayload{Source: "EPG fallback", Events: cloneSportsEvents(guideEvents), Leagues: sportsLeagues(guideEvents), UpdatedAtUnix: updated, FavoriteTeams: []string{}}
-		}
-		s.sportsPreparedMu.Unlock()
-	}
-	payload := s.buildSportsPayload(ctx, refresh, budget, snapshot, startedAt, guide)
-	if len(payload.guideSchedule) > 0 {
-		if err := s.persistSportsGuide(ctx, snapshot, startedAt, payload.guideSchedule); err != nil {
-			log.Printf("sports: generated guide could not be updated: %v", err)
-		}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget.total())
+	payload := s.sportsPayloadWithBudget(ctx, refresh, budget)
 	cancel()
 
 	now := time.Now()
 	s.sportsPreparedMu.Lock()
 	previousComplete := s.sportsPrepared.Ready && !s.sportsPrepared.Incomplete && len(s.sportsPrepared.Payload.Events) > 0
-	keepPrevious := false
 	switch {
 	case payload.Error != "" && s.sportsPrepared.Ready && len(s.sportsPrepared.Payload.Events) > 0:
 		stale := cloneSportsPayload(s.sportsPrepared.Payload)
@@ -272,15 +238,11 @@ func (s *HTTPRoutesServer) rebuildSportsPayload(refresh bool) {
 		payload = stale
 	case payload.Incomplete && previousComplete:
 		// Keep serving the last complete payload rather than one with
-		// unmatched channels, and retry soon.
-		keepPrevious = true
-	}
-	if keepPrevious {
+		// unmatched channels, and retry soon. Recording the guide revision
+		// makes the retry wait for the short deadline instead of restarting on
+		// the next request.
 		s.sportsPrepared.Refreshing = false
-		// Record the guide revision so the retry waits for the short deadline
-		// instead of restarting on the next request.
 		s.sportsPrepared.GuideUpdatedUnix = guideUpdatedUnix
-		s.sportsPrepared.GuidePolicyKey = policyKey
 		s.sportsPrepared.ExpiresAfter = now.Add(sportsIncompleteRetry)
 		s.sportsPreparedMu.Unlock()
 		return
@@ -291,7 +253,6 @@ func (s *HTTPRoutesServer) rebuildSportsPayload(refresh bool) {
 	s.sportsPrepared.Refreshing = false
 	s.sportsPrepared.Incomplete = payload.Incomplete
 	s.sportsPrepared.GuideUpdatedUnix = guideUpdatedUnix
-	s.sportsPrepared.GuidePolicyKey = policyKey
 	s.sportsPrepared.ExpiresAfter = now.Add(sportsPreparedTTL(payload))
 	s.sportsPreparedMu.Unlock()
 }
@@ -341,7 +302,7 @@ func (s *HTTPRoutesServer) cachedSportsEvents(ctx context.Context, now time.Time
 		return []SportsEvent{}, now.Unix(), source, err
 	}
 	for index := range events {
-		events[index].ProviderSource = firstNonEmpty(strings.TrimSpace(events[index].ProviderSource), strings.TrimSpace(source))
+		events[index].ProviderSource = strings.TrimSpace(source)
 	}
 	events = normalizeSportsEvents(events)
 	updatedUnix := now.Unix()

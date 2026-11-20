@@ -3,67 +3,10 @@ package plugin
 import (
 	"embed"
 	"fmt"
-	mediaweb "github.com/attmonk/silo-plugins/pkg/livemedia/web"
-	"strings"
 )
 
-//go:embed ui/page.html ui/styles.css ui/*.js
-var playerUIFiles embed.FS
-
-// playerAppScriptParts is the source order of the browser "app.js" asset. The
-// app is split into files for maintainability, but it is served (and tested)
-// as ONE classic script, so every part shares a single top-level scope.
-// core.js must stay first (it declares the route/state globals every other
-// part reads), prefs.js second (the settings write queue and prefs sync state
-// it declares are read by later top-level code), and app.js last (it ends with
-// the load-time event wiring and route restore, which needs every const/let
-// above it initialized). The middle parts only declare functions.
-var playerAppScriptParts = []string{
-	"ui/core.js",
-	"ui/prefs.js",
-	"ui/sports_assist.js",
-	"ui/sports_moments.js",
-	"ui/sports_following.js",
-	"ui/sports_companion.js",
-	"ui/sports.js",
-	"ui/admin.js",
-	"ui/multiview.js",
-	"ui/sports_multiview.js",
-	"ui/guide.js",
-	"ui/player.js",
-	"ui/app.js",
-}
-
-// playerScriptOrder is the order the page loads its scripts (see page.html);
-// "ui/app.js" here is the composed playerAppScriptParts bundle.
-var playerScriptOrder = []string{"ui/lineup.js", "ui/app.js"}
-
-// composedUIAssets serves embedded UI files, composing ui/app.js from its parts.
-type composedUIAssets struct {
-	files embed.FS
-}
-
-func (assets composedUIAssets) ReadFile(name string) ([]byte, error) {
-	if name != "ui/app.js" {
-		return assets.files.ReadFile(name)
-	}
-	// Keep the shared client in the authenticated app asset. A dynamic script
-	// element cannot supply Silo authorization headers.
-	parts := make([]string, 0, len(playerAppScriptParts)+1)
-	for _, part := range playerAppScriptParts {
-		payload, err := assets.files.ReadFile(part)
-		if err != nil {
-			return nil, fmt.Errorf("read app script part %s: %w", part, err)
-		}
-		parts = append(parts, strings.TrimRight(string(payload), "\n"))
-		if part == "ui/core.js" {
-			parts = append(parts, string(mediaweb.ClientScript))
-		}
-	}
-	return []byte(strings.Join(parts, "\n") + "\n"), nil
-}
-
-var playerUIAssets = composedUIAssets{files: playerUIFiles}
+//go:embed ui/page.html ui/styles.css ui/features.css ui/lineup.js ui/app.js
+var playerUIAssets embed.FS
 
 var playerPageHTMLTemplate string
 
@@ -80,15 +23,15 @@ func mustLoadPlayerPageHTMLTemplate() string {
 }
 
 func playerAppJavaScript() string {
-	parts := make([]string, 0, len(playerScriptOrder))
-	for _, name := range playerScriptOrder {
-		payload, err := playerUIAssets.ReadFile(name)
-		if err != nil {
-			return ""
-		}
-		parts = append(parts, string(payload))
+	lineup, err := playerUIAssets.ReadFile("ui/lineup.js")
+	if err != nil {
+		return ""
 	}
-	return strings.Join(parts, "\n")
+	script, err := playerUIAssets.ReadFile("ui/app.js")
+	if err != nil {
+		return ""
+	}
+	return string(lineup) + "\n" + string(script)
 }
 
 func playerStylesCSS() string {
@@ -96,5 +39,9 @@ func playerStylesCSS() string {
 	if err != nil {
 		return ""
 	}
-	return string(styles)
+	features, err := playerUIAssets.ReadFile("ui/features.css")
+	if err != nil {
+		return string(styles)
+	}
+	return string(styles) + "\n" + string(features)
 }

@@ -1,8 +1,6 @@
 package config
 
 import (
-	"strings"
-
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 )
 
@@ -178,14 +176,11 @@ func GlobalConfigSchema() []*ConfigSchema {
 
 func UserConfigSchema() []*ConfigSchema {
 	return []*ConfigSchema{
-		objectSchema("preferences", "Preferences", "Per-user Xtream browsing preferences stored by Silo.", `{"type":"object","properties":{"sportsStatsDelaySeconds":{"type":"integer","minimum":0,"maximum":300},"favorites":{"type":"object","additionalProperties":{"type":"boolean"}},"favoriteOrder":{"type":"array","items":{"type":"string"}},"hiddenCategories":{"type":"object","additionalProperties":{"type":"boolean"}},"groupCategoriesByPipe":{"type":"boolean"},"recentSearches":{"type":"array","items":{"type":"string"}},"recentChannels":{"type":"array","items":{"type":"string"}},"continueWatching":{"type":"object","additionalProperties":true},"playback":{"type":"object","additionalProperties":true},"profiles":{"type":"object","additionalProperties":{"type":"object"}},"customGroups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"order":{"type":"integer"}},"required":["id","name"],"additionalProperties":false}},"customGroupMemberships":{"type":"object","additionalProperties":{"type":"array","items":{"type":"string"}}}},"additionalProperties":false}`, false, []*pluginv1.AdminFormField{}, "Save preferences"),
+		objectSchema("preferences", "Preferences", "Per-user Xtreme browsing preferences stored by Silo.", `{"type":"object","properties":{"favorites":{"type":"object","additionalProperties":{"type":"boolean"}},"favoriteOrder":{"type":"array","items":{"type":"string"}},"hiddenCategories":{"type":"object","additionalProperties":{"type":"boolean"}},"groupCategoriesByPipe":{"type":"boolean"},"recentSearches":{"type":"array","items":{"type":"string"}},"recentChannels":{"type":"array","items":{"type":"string"}},"continueWatching":{"type":"object","additionalProperties":true},"playback":{"type":"object","additionalProperties":true},"customGroups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"order":{"type":"integer"}},"required":["id","name"],"additionalProperties":false}},"customGroupMemberships":{"type":"object","additionalProperties":{"type":"array","items":{"type":"string"}}}},"additionalProperties":false}`, false, []*pluginv1.AdminFormField{}, "Save preferences"),
 	}
 }
 
 func objectSchema(key, title, description, jsonSchema string, required bool, fields []*pluginv1.AdminFormField, submitLabel string) *ConfigSchema {
-	if key == "preferences" {
-		jsonSchema = strings.Replace(jsonSchema, `"sportsStatsDelaySeconds":`, `"sportsMomentsEnabled":{"type":"boolean"},"sportsChannelDelays":{"type":"object","maxProperties":256,"additionalProperties":{"type":"integer","minimum":0,"maximum":300}},"sportsSwitchMode":{"type":"string","enum":["off","suggest","auto"]},"sportsFavoritePlayers":{"type":"object","maxProperties":200,"additionalProperties":{"type":"object","properties":{"name":{"type":"string","maxLength":120},"leagueId":{"type":"string","maxLength":80},"teamSlug":{"type":"string","maxLength":120},"teamName":{"type":"string","maxLength":120},"observedAtUnix":{"type":"number"}},"required":["name","leagueId"],"additionalProperties":false}},"sportsMultiviewLayout":{"type":"integer","enum":[2,4]},"sportsMultiviewPresets":{"type":"object","maxProperties":8,"additionalProperties":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":40},"layout":{"type":"integer","enum":[2,4]},"channelIds":{"type":"array","maxItems":4,"items":{"type":"string"}}},"required":["name","layout","channelIds"],"additionalProperties":false}},"sportsStatsDelaySeconds":`, 1)
-	}
 	return &pluginv1.ConfigSchema{
 		Key:         key,
 		Title:       title,

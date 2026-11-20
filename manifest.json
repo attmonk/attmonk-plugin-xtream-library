@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.attmonk.xtream",
-  "version": "0.9.1",
+  "version": "0.2.71",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -27,13 +27,13 @@
     {
       "type": "scheduled_task.v1",
       "id": "xtream-refresh-channels",
-      "display_name": "Xtream channel refresh",
+      "display_name": "Refresh Live TV Channels",
       "description": "Refreshes source channel and group metadata."
     },
     {
       "type": "scheduled_task.v1",
       "id": "xtream-refresh-epg",
-      "display_name": "Xtream guide refresh",
+      "display_name": "Refresh Live TV Guide",
       "description": "Purges stale guide data and refreshes source EPG programs."
     },
     {
@@ -322,34 +322,6 @@
       "navigable": false
     },
     {
-      "id": "dispatcharr-api-my-sources",
-      "method": "GET",
-      "path": "/dispatcharr/api/my-sources",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-my-sources-update",
-      "method": "POST",
-      "path": "/dispatcharr/api/my-sources",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-my-sources-delete",
-      "method": "DELETE",
-      "path": "/dispatcharr/api/my-sources",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-my-refresh",
-      "method": "POST",
-      "path": "/dispatcharr/api/my-refresh",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
       "id": "dispatcharr-api-watch-start",
       "method": "POST",
       "path": "/dispatcharr/api/watch/start",
@@ -382,118 +354,6 @@
       "method": "GET",
       "path": "/dispatcharr/api/sports/image",
       "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-info",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/info",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-channels",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/channels",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-programs",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/programs",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-stream",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/stream",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-session-heartbeat",
-      "method": "POST",
-      "path": "/silo-compat/livetv/v1/session/heartbeat",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-session-stop",
-      "method": "POST",
-      "path": "/silo-compat/livetv/v1/session/stop",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-api-media-start",
-      "path": "/xtream/api/media/start",
-      "method": "POST",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-api-media-status",
-      "path": "/xtream/api/media/status",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-api-media-stop",
-      "path": "/xtream/api/media/stop",
-      "method": "POST",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-relay-media",
-      "path": "/xtream/relay/media",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-converted-media",
-      "path": "/xtream/converted/media",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-rewind-manifest",
-      "path": "/xtream/rewind/manifest",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-rewind-segment",
-      "path": "/xtream/rewind/segment",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-assets-media-js",
-      "path": "/xtream/assets/media.js",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-api-media-admin-status",
-      "path": "/xtream/api/media/admin-status",
-      "method": "GET",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "shared-api-media-clear",
-      "path": "/xtream/api/media/clear",
-      "method": "POST",
-      "access": "admin",
       "navigable": false
     }
   ],

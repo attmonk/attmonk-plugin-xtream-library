@@ -55,7 +55,7 @@ func TestCollegeFootballStatsFetchAndCache(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/scoreboard":
-			if r.URL.Query().Get("dates") != "20260905" && r.URL.Query().Get("dates") != "20260906" {
+			if r.URL.Query().Get("dates") != "20260905-20260906" {
 				t.Error("wrong date window")
 			}
 			ioJSON := `{"events":[{"id":"401860879","competitions":[` + statsFixtureCompetition + `]}]}`
@@ -82,8 +82,8 @@ func TestCollegeFootballStatsFetchAndCache(t *testing.T) {
 		t.Fatalf("possession must use ESPN's current situation: %+v", value)
 	}
 	_ = cache.load(context.Background(), statsFixtureEvent())
-	if requests != 3 {
-		t.Fatalf("expected cached daily scoreboards and summary, got %d requests", requests)
+	if requests != 2 {
+		t.Fatalf("expected cached scoreboard and summary, got %d requests", requests)
 	}
 }
 
@@ -137,47 +137,5 @@ func TestCollegeFootballStatsUsesRegisteredSportsRoute(t *testing.T) {
 	response, _ = server.Handle(context.Background(), &pluginv1.HandleHTTPRequest{Method: http.MethodGet, Path: "/dispatcharr/api/sports", Query: query})
 	if response.GetStatusCode() != http.StatusNotFound {
 		t.Fatal("expired fixture identities must not remain available indefinitely")
-	}
-}
-
-func TestESPNSummaryKeepsClockForStreamCalibration(t *testing.T) {
-	t.Parallel()
-	var summary espnStatsSummary
-	if err := json.Unmarshal([]byte(`{"header":{"id":"1","competitions":[{"status":{"period":2,"displayClock":"8:40","type":{"state":"in"}}}]}}`), &summary); err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := json.Marshal(espnGameStats(SportsEvent{}, summary))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(encoded, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["period"] != float64(2) || payload["clock"] != "8:40" {
-		t.Fatalf("game clock lost in stats response: period=%v clock=%v", payload["period"], payload["clock"])
-	}
-}
-
-func TestESPNFootballDriveMomentsKeepPlayIdentityAndInjuryType(t *testing.T) {
-	t.Parallel()
-	var summary espnStatsSummary
-	if err := json.Unmarshal([]byte(`{"header":{"id":"1","competitions":[{"status":{"type":{"state":"in"}}}]},"drives":{"current":{"plays":[{"id":"injury-1","text":"Injury timeout","type":{"text":"Injury Timeout"}},{"id":"score-1","text":"Touchdown","scoringPlay":true}]}}}`), &summary); err != nil {
-		t.Fatal(err)
-	}
-	plays := espnGameStats(SportsEvent{LeagueID: "nfl"}, summary).Plays
-	if len(plays) != 2 {
-		t.Fatalf("football drive moments missing: %+v", plays)
-	}
-	encoded, err := json.Marshal(plays)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var payload []map[string]any
-	if err := json.Unmarshal(encoded, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload[0]["id"] != "score-1" || payload[0]["scoring"] != true || payload[1]["id"] != "injury-1" || payload[1]["injury"] != true {
-		t.Fatalf("play metadata lost: %s", encoded)
 	}
 }

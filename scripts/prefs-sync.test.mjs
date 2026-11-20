@@ -2,11 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import appSourceModule from './app-source.cjs';
-const { appSource } = appSourceModule;
 
 // Ported from the Dispatcharr plugin; the preference sync engine lives in app.js.
-const source = appSource();
+const source = fs.readFileSync(new URL('../internal/plugin/ui/app.js', import.meta.url), 'utf8');
 
 function slice(startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -33,7 +31,6 @@ function setup(remoteValues, options = {}) {
     normalizeKeywordPasses: value => Array.isArray(value) ? value : [],
     normalizePreferences() {},
     readRecentSearches: () => [],
-    coreStoredValue: () => '',
     showAppToast(message) { ctx.toasts.push(message); },
     renderSettings() {}, render() { ctx.renders += 1; },
     document: { hidden: false, addEventListener() {} },

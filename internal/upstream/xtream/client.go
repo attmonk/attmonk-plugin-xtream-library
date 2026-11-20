@@ -14,7 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	sharedhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
+	sharedhttp "github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/httpclient"
 )
 
 type Client struct {
@@ -25,20 +25,11 @@ type Client struct {
 }
 
 func NewClient(baseURL, username, password string) *Client {
-	return NewClientWithHTTP(baseURL, username, password, nil)
-}
-
-// NewClientWithHTTP uses httpClient for every request; nil means the default
-// client. Per-user providers pass a restricted client (see TenantRouter).
-func NewClientWithHTTP(baseURL, username, password string, httpClient *http.Client) *Client {
-	if httpClient == nil {
-		httpClient = sharedhttp.New()
-	}
 	return &Client{
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		username: username,
 		password: password,
-		http:     httpClient,
+		http:     sharedhttp.New(),
 	}
 }
 
@@ -247,7 +238,7 @@ func (c *Client) resolveMediaURL(kind string, streamID int64, extension string) 
 func (c *Client) getJSON(ctx context.Context, action string, params map[string]string, target any) error {
 	endpoint, err := url.Parse(c.baseURL)
 	if err != nil {
-		return fmt.Errorf("parse base url: %w", sharedhttp.RedactErrorURL(err))
+		return fmt.Errorf("parse base url: %w", err)
 	}
 	endpoint.Path = path.Join(endpoint.Path, "player_api.php")
 

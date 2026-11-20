@@ -12,9 +12,9 @@ import (
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/config"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/model"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/dispatcharr"
+	sharedhttp "github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/httpclient"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/xmltv"
 	"github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/xtream"
-	sharedhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
 )
 
 type XtreamClient interface {
@@ -53,13 +53,11 @@ type Dependencies struct {
 	// decoded incrementally instead of being buffered in full. When nil and
 	// FetchURL is set, OpenURL wraps FetchURL's bytes.
 	OpenURL func(ctx context.Context, rawURL string) (io.ReadCloser, error)
-	// HTTPClient, when set, replaces the default client for provider and
-	// XMLTV requests. Per-user providers set a restricted one.
-	HTTPClient *http.Client
 }
 
 type Service struct {
 	store              *cache.Store
+	snapshotStorage    cache.SnapshotStorage
 	xtreamFactory      func(baseURL, username, password string) XtreamClient
 	dispatcharrFactory func(settings config.Settings) DispatcharrClient
 	fetchURL           func(ctx context.Context, rawURL string) ([]byte, error)
@@ -77,7 +75,7 @@ func NewService(deps Dependencies) *Service {
 	factory := deps.XtreamFactory
 	if factory == nil {
 		factory = func(baseURL, username, password string) XtreamClient {
-			return xtream.NewClientWithHTTP(baseURL, username, password, deps.HTTPClient)
+			return xtream.NewClient(baseURL, username, password)
 		}
 	}
 	dispatcharrFactory := deps.DispatcharrFactory
@@ -91,9 +89,6 @@ func NewService(deps Dependencies) *Service {
 	}
 
 	client := &http.Client{Timeout: 5 * time.Minute}
-	if deps.HTTPClient != nil {
-		client = deps.HTTPClient
-	}
 	defaultOpen := func(ctx context.Context, rawURL string) (io.ReadCloser, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
@@ -136,8 +131,7 @@ func NewService(deps Dependencies) *Service {
 		}
 	}
 
-	store.SetStorage(deps.SnapshotStorage)
-	return &Service{store: store, xtreamFactory: factory, dispatcharrFactory: dispatcharrFactory, fetchURL: fetcher, openURL: opener}
+	return &Service{store: store, snapshotStorage: deps.SnapshotStorage, xtreamFactory: factory, dispatcharrFactory: dispatcharrFactory, fetchURL: fetcher, openURL: opener}
 }
 
 // fetchXMLTV streams an XMLTV document from rawURL, decoding it token by token
@@ -161,11 +155,13 @@ func (s *Service) fetchXMLTV(ctx context.Context, rawURL, label string) (xmltv.D
 }
 
 func (s *Service) replaceSnapshot(snapshot cache.Snapshot) error {
-	return s.store.Replace(snapshot)
+	s.store.Replace(snapshot)
+	return s.persistSnapshot()
 }
 
 func (s *Service) replaceSnapshotExact(snapshot cache.Snapshot) error {
-	return s.store.ReplaceExact(snapshot)
+	s.store.ReplaceExact(snapshot)
+	return s.persistSnapshot()
 }
 
 func (s *Service) replaceSnapshotAfterSync(snapshot cache.Snapshot, exactGuide bool) error {
@@ -182,11 +178,19 @@ func (s *Service) replacePrograms(programs []model.Program, atUnix int64) error 
 		_ = s.persistSnapshot()
 		return err
 	}
-	_, err := s.store.ReplacePrograms(programs, atUnix)
-	return err
+	s.store.ReplacePrograms(programs, atUnix)
+	return s.persistSnapshot()
 }
 
-func (s *Service) persistSnapshot() error { return s.store.Persist() }
+func (s *Service) persistSnapshot() error {
+	if s.snapshotStorage == nil {
+		return nil
+	}
+	if err := s.snapshotStorage.Save(s.store.Current()); err != nil {
+		return fmt.Errorf("persist catalog snapshot: %w", err)
+	}
+	return nil
+}
 
 func (s *Service) SwitchSourceMode(ctx context.Context, previous, next config.Settings, nowUnix int64) (string, error) {
 	warning := ""

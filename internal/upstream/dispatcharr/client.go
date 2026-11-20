@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	sharedhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
+	sharedhttp "github.com/attmonk/attmonk-plugin-xtream-library/internal/upstream/httpclient"
 )
 
 const maxPaginationPages = 2000

@@ -2,10 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import appSourceModule from './app-source.cjs';
-const { appSource, topLevelFunction } = appSourceModule;
 
-const app = appSource();
+const app = fs.readFileSync(new URL('../internal/plugin/ui/app.js', import.meta.url), 'utf8');
 
 function fn(source, name) {
   const start = source.indexOf('function ' + name + '(');
@@ -87,31 +85,4 @@ test('a live multiview tile keeps its session', async () => {
   assert.equal((await started).id, 'session-1');
   assert.equal(tile.session.id, 'session-1');
   assert.deepEqual(stops(calls), []);
-});
-
-
-test('automatic live rewind uses managed playback with the existing watch lease even when direct credentials are disabled', async () => {
-  const sources = [];
-  const ctx = vm.createContext({
-    URL, window: {location: {href: 'https://silo.example/api/v2/plugin-content/plugins/18/xtream'}},
-    state: {view: 'player', timeShiftAttempt: 0},
-    stopTimeShiftSession() { ctx.state.timeShiftAttempt++; },
-    render() {}, async ensurePlayerLibraries() {},
-    liveRewindEnabled: () => true, isRewindableChannel: () => false,
-    async startWatch() { return {id: 'watch-1'}; },
-    browserStreamURL: (channel, id) => '/xtream/stream?channel_id=' + channel.id + '&session_id=' + id,
-    adminSettings: () => ({allowDirectProviderURLs: false}),
-    coreFetch: async () => { throw new Error('live channels must not probe the legacy stream route'); },
-    setVideoSource: (url, options) => sources.push({url, options}),
-    async getJSON() { return {programs: []}; }, byId: () => null,
-    showPlayerToast: message => assert.fail(message),
-    showPlayerError: message => assert.fail(message),
-    capturePlayerReturnContext() {}
-  });
-  vm.runInContext(['playChannel', 'showStreamBlockedIfNeeded', 'streamBlockedMessage'].map(name => topLevelFunction(app, name)).join('\n'), ctx);
-  await ctx.playChannel({id:'news', streamFormat:'ts'});
-  assert.equal(sources.length, 1);
-  const url = new URL(sources[0].url, 'https://silo.example');
-  assert.equal(url.searchParams.get('session_id'), 'watch-1');
-  assert.equal(url.searchParams.get('media_mode'), 'rewind');
 });
