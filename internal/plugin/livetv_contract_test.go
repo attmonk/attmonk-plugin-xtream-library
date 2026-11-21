@@ -72,7 +72,7 @@ func TestLiveTVContractInfo(t *testing.T) {
 	if err := json.Unmarshal(response.GetBody(), &info); err != nil {
 		t.Fatalf("decode info: %v", err)
 	}
-	if info.ContractVersion != 1 || info.Name != "XC for Silo" {
+	if info.ContractVersion != 1 || info.Name != "Xtream for Silo" {
 		t.Fatalf("unexpected info: %+v", info)
 	}
 	want := []string{"cdn.example", "dispatcharr.example:9191", "frost.example:8080", "spare.example"}

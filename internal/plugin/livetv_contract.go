@@ -63,7 +63,7 @@ func (s *HTTPRoutesServer) handleLiveTVInfo(ctx context.Context) *pluginv1.Handl
 	s.ensureCatalogHydrated(ctx)
 	return jsonHTTPResponse(http.StatusOK, livetvInfo{
 		ContractVersion: livetvContractVersion,
-		Name:            "XC for Silo",
+		Name:            "Xtream for Silo",
 		StreamHosts:     livetvStreamHosts(s.liveTVSettings(), s.store.Current().Catalog.Channels),
 		PerUserLineup:   s.tenantUserID != "",
 	})

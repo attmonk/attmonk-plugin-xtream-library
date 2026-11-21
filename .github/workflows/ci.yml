@@ -120,7 +120,7 @@ jobs:
     uses: attmonk/silo-plugins/.github/workflows/publish-plugin.yml@main
     with:
       plugin-id: silo.attmonk.xtream
-      display-name: XC for Silo
+      display-name: Xtream for Silo
       asset-prefix: xtream-{version}-
       replace-old: false
     secrets: inherit

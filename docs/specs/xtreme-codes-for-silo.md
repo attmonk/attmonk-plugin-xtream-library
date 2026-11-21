@@ -114,7 +114,7 @@ features are excluded.
   response mechanism is deliberately deferred until the SDK capability
   contract is verified. No generic arbitrary-URL proxy is allowed.
 - The plugin does not promise per-user upstream credentials or visibility into
-  connections made outside XC for Silo. It enforces configured limits against
+  connections made outside Xtream for Silo. It enforces configured limits against
   its own heartbeat-backed watch-session leases; the provider remains the
   authority for the actual upstream allowance.
 - Full Xtream content includes Live TV, EPG, VOD, series metadata, episode

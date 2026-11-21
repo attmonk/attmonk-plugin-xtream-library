@@ -30,8 +30,8 @@ jobs:
     with:
       auto: ${{ github.event_name == 'push' }}
       version: ${{ inputs.version }}
-      commit-message: "chore(release): XC for Silo {version}"
-      tag-message: XC for Silo v{version}
+      commit-message: "chore(release): Xtream for Silo {version}"
+      tag-message: Xtream for Silo v{version}
       release-notes: docs/releases/v{version}.md
       verify: ./scripts/verify-release.sh {version}
     secrets: inherit

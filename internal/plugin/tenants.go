@@ -83,7 +83,7 @@ func (r *TenantRouter) Handle(ctx context.Context, request *pluginv1.HandleHTTPR
 	if userID == "" && normalizePublicPath(request.GetPath()) == "/silo-compat/livetv/v1/info" {
 		// Silo's bridge may probe info without a caller; say lineups are
 		// per user and list no hosts, since hosts are per user too.
-		return jsonHTTPResponse(http.StatusOK, livetvInfo{ContractVersion: livetvContractVersion, Name: "XC for Silo", StreamHosts: []string{}, PerUserLineup: true}), nil
+		return jsonHTTPResponse(http.StatusOK, livetvInfo{ContractVersion: livetvContractVersion, Name: "Xtream for Silo", StreamHosts: []string{}, PerUserLineup: true}), nil
 	}
 	if !tenantUserIDPattern.MatchString(userID) {
 		return textResponse(http.StatusUnauthorized, "a signed-in Silo user is required"), nil

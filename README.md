@@ -1,4 +1,4 @@
-# XC for Silo
+# Xtream for Silo
 
 > **Independent ATTMonk plugin — unsupported by Silo Server.**
 > Silo Server does not support this Dispatcharr, IPTV/Live TV, or HDHomeRun integration.
@@ -58,7 +58,7 @@ Admin can add compatible sub-accounts for playback and set the provider-issued
 stream limit for each account. A watch session stays on one account, the
 least-used available account is selected for new playback, and the lease is
 released when playback stops or its heartbeat expires. Each Multiview tile
-uses one lease. These counters cover XC for Silo sessions only; they cannot see
+uses one lease. These counters cover Xtream for Silo sessions only; they cannot see
 connections created outside this plugin.
 
 ## Guide refreshes

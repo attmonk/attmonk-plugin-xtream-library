@@ -253,8 +253,11 @@ func TestManifestIdentifiesStandaloneXtremeCodesPlugin(t *testing.T) {
 	if manifest.GetPluginId() != "silo.attmonk.xtream" {
 		t.Fatalf("expected standalone plugin id, got %q", manifest.GetPluginId())
 	}
-	if displayName, _ := manifest.GetMetadata().AsMap()["display_name"].(string); displayName != "XC for Silo" {
+	if displayName, _ := manifest.GetMetadata().AsMap()["display_name"].(string); displayName != "Xtream for Silo" {
 		t.Fatalf("expected standalone display name, got %q", displayName)
+	}
+	if manifest.GetPresentation().GetDisplayName() != "Xtream for Silo" {
+		t.Fatalf("expected catalog presentation name, got %q", manifest.GetPresentation().GetDisplayName())
 	}
 }
 
