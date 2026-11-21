@@ -1,11 +1,7 @@
-github.com/Silo-Server/silo-plugin-sdk v0.32.1 h1:DrT0yAeVHqR58RNcVpbQvh8U2H2ermv3mHokoy9m+ds=
-github.com/Silo-Server/silo-plugin-sdk v0.32.1/go.mod h1:+r4X2TAiB9Gk22sUj1gFWUj65lll1P1/dMS+Ncvy3Y0=
-github.com/attmonk/silo-plugins v0.1.16 h1:FRUWgibyiuuX5rxC0/ZtS5PJY1S3rgasn0vCvAUoDtQ=
-github.com/attmonk/silo-plugins v0.1.16/go.mod h1:4kC/IAc9AwyozAC88e2sg3zmMyLLCRRvjgh9VQaI24I=
-github.com/attmonk/silo-plugins v0.1.17 h1:kvAlqcsK9JtZlc7z8BJu+gpgdasrBL+XzwocAd75sQQ=
-github.com/attmonk/silo-plugins v0.1.17/go.mod h1:4kC/IAc9AwyozAC88e2sg3zmMyLLCRRvjgh9VQaI24I=
-github.com/attmonk/silo-plugins v0.1.18 h1:u8kZsyuMYuk04KJKZOGQrYOX0bzSjRfO881UJTihwys=
-github.com/attmonk/silo-plugins v0.1.18/go.mod h1:4kC/IAc9AwyozAC88e2sg3zmMyLLCRRvjgh9VQaI24I=
+github.com/Silo-Server/silo-plugin-sdk v0.35.0 h1:hOYY3BpXKVBty71/3ws3mvd7DQWX0VhHbQouQ6Zj5/A=
+github.com/Silo-Server/silo-plugin-sdk v0.35.0/go.mod h1:+r4X2TAiB9Gk22sUj1gFWUj65lll1P1/dMS+Ncvy3Y0=
+github.com/attmonk/silo-plugins v0.1.19 h1:zve5Oz1gONLQKMoCMkCjtnfzrQUxmRqDPIfZiS1U6Ns=
+github.com/attmonk/silo-plugins v0.1.19/go.mod h1:1g+aGgw9+QIrBpqBsxoGFmvvBPhbXCQh0R9FbClmrZw=
 github.com/bufbuild/protocompile v0.14.1 h1:iA73zAf/fyljNjQKwYzUHD6AD4R8KMasmwa/FBatYVw=
 github.com/bufbuild/protocompile v0.14.1/go.mod h1:ppVdAIhbr2H8asPk6k4pY7t9zB1OU5DoEw9xY/FUi1c=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
